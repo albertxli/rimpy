@@ -1,0 +1,65 @@
+[project]
+name = "rimpy"
+version = "0.1.0"
+description = "Fast RIM (raking) survey weighting with narwhals - supports polars and pandas"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Albert Li" },
+]
+keywords = [
+    "survey",
+    "weighting",
+    "raking",
+    "rim",
+    "rim-weighting",
+    "iterative-proportional-fitting",
+    "ipf",
+    "market-research",
+    "polars",
+    "pandas",
+    "narwhals",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "narwhals>=2.16.0",
+    "numpy>=2.4.2",
+]
+
+[project.optional-dependencies]
+polars = ["polars>=1.38.1"]
+pandas = ["pandas>=3.0.0"]
+all = ["polars>=1.38.1", "pandas>=3.0.0"]
+dev = [
+    "pytest>=9.0.2",
+    "pandas>=3.0.0",
+    "polars>=1.38.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/albertxli/rimpy"
+Documentation = "https://github.com/albertxli/rimpy"
+Repository = "https://github.com/albertxli/rimpy"
+
+# --- Build with maturin (compiles Rust + packages Python) ---
+[build-system]
+requires = ["maturin>=1.12.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Mixed Rust/Python project: Python source lives in python/
+python-source = "python"
+# The compiled .so module name
+module-name = "rimpy._rimpy_engine"
+# Build features
+features = ["pyo3/extension-module"]

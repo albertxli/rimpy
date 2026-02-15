@@ -1,0 +1,26 @@
+[package]
+name = "rimpy_engine"
+version = "0.1.0"
+edition = "2024"
+description = "Fast RIM/raking engine for rimpy"
+
+[lib]
+name = "_rimpy_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+numpy = "0.28"               # Zero-copy NumPy array access
+rayon = "1.10"               # Parallel iteration for grouped raking
+indexmap = "2"               # Preserves insertion order like Python dict
+# arrow = { version = "54", optional = true }  # Future: zero-copy from Polars
+
+[features]
+default = []
+# arrow = ["dep:arrow"]  # Enable when ready for Arrow FFI path
+
+[profile.release]
+lto = true                   # Link-time optimization for max speed
+codegen-units = 1            # Single codegen unit = better optimization
+opt-level = 3
+strip = true
