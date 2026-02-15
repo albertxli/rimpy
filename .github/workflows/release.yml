@@ -1,0 +1,79 @@
+name: Build & Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # manual trigger for testing
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # Build wheels for each OS × Python version
+  # ---------------------------------------------------------------
+  build:
+    name: Build / ${{ matrix.os }} / ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+        python: ["3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist -i python${{ matrix.python }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*.whl
+
+  # ---------------------------------------------------------------
+  # Build source distribution (fallback for unsupported platforms)
+  # ---------------------------------------------------------------
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -o dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------
+  # Publish everything to PyPI
+  # ---------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    needs: [build, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing (no API token needed)
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
