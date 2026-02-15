@@ -3,6 +3,8 @@ target/
 Cargo.lock
 
 # Compiled Python extensions (built by maturin)
+# These MUST be excluded — committing them causes CI to fail
+# because maturin refuses to overwrite pre-existing compiled files
 *.pyd
 *.so
 *.dylib
@@ -10,13 +12,29 @@ Cargo.lock
 # Python
 __pycache__/
 *.pyc
+*.pyo
 *.egg-info/
+*.egg
 dist/
 build/
 
 # Virtual environments
 .venv/
+venv/
 
 # IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+uv.lock
+
+# Internal docs
+Structure.md
+RELEASE_GUIDE.md

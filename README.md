@@ -1,125 +1,343 @@
-# rimpy — Rust-accelerated RIM engine
+# rimpy
 
-## Architecture
+**Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narhwlas.**
 
-```
-rimpy/
-├── Cargo.toml                    # Rust crate definition
-├── pyproject.toml                # Python package (maturin build)
-├── src/                          # Rust source
-│   ├── lib.rs                    # PyO3 bindings + module exports
-│   └── engine.rs                 # Core RIM algorithm (pure Rust)
-├── python/                       # Python source (maturin mixed layout)
-│   └── rimpy/
-│       ├── __init__.py           # Public API (unchanged)
-│       ├── _engine.py            # Shim: tries Rust → falls back to Python
-│       ├── _engine_py.py         # Pure Python/NumPy fallback
-│       ├── _rake.py              # Narwhals orchestration (unchanged)
-│       └── _loaders.py           # Scheme loaders (unchanged)
-├── tests/
-│   └── test_backend_parity.py    # Validates Rust == Python results
-└── benchmarks/
-    └── bench_engine.py           # Performance comparison
-```
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
-### What changed, what didn't
+## Features
 
-| File | Status | Why |
-|------|--------|-----|
-| `_rake.py` | **Unchanged** | Orchestration layer, not a bottleneck |
-| `_loaders.py` | **Unchanged** | I/O bound, no benefit from Rust |
-| `__init__.py` | **Unchanged** | Public API stays the same |
-| `_engine.py` | **Now a shim** | Tries `rimpy_engine` (Rust), falls back to `_engine_py` |
-| `_engine_py.py` | **Renamed original** | Pure Python fallback for portability |
-| `src/engine.rs` | **New** | Core RIM loop in Rust (raw slices, zero alloc) |
-| `src/lib.rs` | **New** | PyO3 bindings accepting NumPy arrays |
+- 🚀 **Fast**: Rust-powered engine with pure Python/NumPy fallback
+- 🔄 **Backend agnostic**: Works with both polars and pandas DataFrames via Narwhals
+- 📦 **Lightweight**: Only depends on narwhals and numpy
+- 🎯 **Simple API**: One function call to weight your data
+- ✅ **Inspiration**: Inspired by weightipy and check out their amazing work if you have more complex weighting needs
 
-### Why this design
-
-- **Zero API changes**: `_rake.py` still does `from ._engine import RakeResult, rim_iterate`. Users see no difference.
-- **Graceful fallback**: No Rust compiler? No problem — pure Python still works.
-- **Check which backend**: `rimpy._engine.get_backend()` returns `"rust"` or `"python"`.
-
-## Building
-
-### Prerequisites
-
-- Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- uv (already installed)
-
-### Development build
+## Installation
 
 ```bash
-# uv reads [build-system] → maturin, handles everything
-uv pip install -e ".[dev]"
+pip install rimpy
 
-# Verify
-uv run python -c "from rimpy._engine import get_backend; print(get_backend())"
-# → "rust"
+# Or with uv
+uv add rimpy
+
+# With optional dependencies
+pip install rimpy[polars]  # For polars support
+pip install rimpy[all]     # For both polars and pandas
 ```
 
-### Release build (wheel)
+Pre-built wheels are available for Linux, Windows, and macOS (arm64) on Python 3.12–3.14. The Rust engine is included automatically — no Rust toolchain needed.
 
-```bash
-uv build
-# Output: dist/rimpy-0.2.0-cp312-cp312-*.whl
-```
-
-### Publish to PyPI
-
-```bash
-uv publish
-```
-
-### Run benchmarks
-
-```bash
-uv run python benchmarks/bench_engine.py
-```
-
-### Run tests
-
-```bash
-uv run pytest tests/ -v
-```
-
-## Rust engine design decisions
-
-### Why raw `Vec<f64>` instead of ndarray or Arrow?
-
-RIM's core operation is **indexed gather/scatter on a 1D array**:
-- Gather: sum `weights[indices]` for each category
-- Scatter: `weights[indices] *= multiplier`
-
-This is trivially expressed with plain slices. `ndarray` would add abstraction overhead
-and allocate on fancy indexing. Arrow is a columnar format, not a compute engine.
-
-Raw slices let `rustc` + LLVM auto-vectorize with SIMD, and the hot loop does **zero
-heap allocations** (the `old_weights` buffer is pre-allocated and reused via `copy_from_slice`).
-
-### Why Rayon for grouped raking?
-
-Each country/segment gets its own weights vector — no shared mutable state.
-This is embarrassingly parallel. `rayon::par_iter()` gives near-linear speedup
-across CPU cores with zero synchronization overhead.
-
-### Data ingress
-
-Currently accepts NumPy arrays via `pyo3-numpy` (near-zero-copy for contiguous arrays).
-
-**Future**: Arrow FFI path for zero-copy from Polars. The engine itself stays the same —
-only the ingress layer changes.
-
-## Integration with existing code
-
-Your `_rake.py` and `_loaders.py` remain identical. The only structural change is:
+## Quick Start
 
 ```python
-# Before (in _rake.py):
-from ._engine import RakeResult, rim_iterate
+import polars as pl
+import rimpy
 
-# After (same import — _engine.py is now a shim):
-from ._engine import RakeResult, rim_iterate  # tries Rust, falls back to Python
+# Your survey data (works with pandas too!)
+df = pl.DataFrame({
+    "gender": [1, 1, 1, 2, 2],
+    "age": [1, 2, 2, 1, 2],
+})
+
+# Define targets (percentages that should sum to 100)
+targets = {
+    "gender": {1: 49, 2: 51},
+    "age": {1: 40, 2: 60},
+}
+
+# Apply weights - returns same type as input
+weighted = rimpy.rake(df, targets)
+print(weighted["weight"])
 ```
 
-The shim handles everything transparently.
+## API Reference
+
+### `rake(df, targets, **options)`
+
+Apply RIM weights to a DataFrame.
+
+```python
+weighted = rimpy.rake(
+    df,                          # polars or pandas DataFrame
+    targets,                     # dict of target proportions
+    max_iterations=1000,         # max iterations before stopping
+    convergence_threshold=0.01,  # convergence criterion
+    min_cap=None,                # minimum weight (optional)
+    max_cap=None,                # maximum weight (optional)
+    weight_column="weight",      # name for weight column
+    drop_nulls=True,             # handle nulls (weight=1.0)
+    total=None,                  # scale weighted sum to this value (optional)
+    cap_correction=True,         # small epsilon on caps to prevent boundary oscillation
+)
+```
+
+#### Controlled Total Base
+
+Scale weights so the weighted sum equals a target population size:
+
+```python
+# 500 respondents projected to a population of 50,000
+weighted = rimpy.rake(df, targets, total=50_000)
+weighted["weight"].sum()  # ≈ 50,000
+```
+
+Rows excluded from raking (e.g., nulls with `drop_nulls=True`) keep weight=1.0 and are not scaled.
+
+### `rake_with_diagnostics(df, targets, **options)`
+
+Same as `rake()` but also returns diagnostics.
+
+```python
+weighted, result = rimpy.rake_with_diagnostics(df, targets)
+
+print(result.converged)      # True/False
+print(result.iterations)     # Number of iterations
+print(result.efficiency)     # Weighting efficiency (0-100%)
+print(result.weight_min)     # Minimum weight
+print(result.weight_max)     # Maximum weight
+print(result.weight_ratio)   # Max/min ratio
+print(result.summary())      # Dict of all stats
+```
+
+### `rake_by(df, targets, by, **options)`
+
+Apply weights separately within groups (same targets for all groups).
+
+```python
+# Weight gender/age within each country
+weighted = rimpy.rake_by(
+    df,
+    targets={"gender": {1: 50, 2: 50}, "age": {1: 30, 2: 40, 3: 30}},
+    by="country",  # or by=["country", "region"]
+)
+
+# With controlled total across all groups
+weighted = rimpy.rake_by(
+    df,
+    targets={"gender": {1: 50, 2: 50}, "age": {1: 30, 2: 40, 3: 30}},
+    by="country",
+    total=50_000,
+)
+```
+
+### `rake_by_scheme(df, schemes, by, **options)`
+
+Apply **different weighting schemes** to different groups. Perfect for multi-country surveys!
+
+```python
+# Each country can weight by DIFFERENT variables
+country_schemes = {
+    "US": {
+        "gender": {1: 49, 2: 51},
+        "age": {1: 20, 2: 30, 3: 30, 4: 20},
+        "region": {1: 25, 2: 25, 3: 25, 4: 25},  # US weights by region
+    },
+    "UK": {
+        "gender": {1: 49, 2: 51},
+        "age": {1: 18, 2: 32, 3: 28, 4: 22},
+        # UK doesn't weight by region or education
+    },
+    "DE": {
+        "gender": {1: 48, 2: 52},
+        "age": {1: 15, 2: 28, 3: 32, 4: 25},
+        "education": {1: 30, 2: 40, 3: 30},  # Germany weights by education
+    },
+}
+
+weighted = rimpy.rake_by_scheme(df, country_schemes, by="country")
+
+# With diagnostics
+weighted, result = rimpy.rake_by_scheme_with_diagnostics(df, country_schemes, by="country")
+print(result.group_results["US"].efficiency)  # 90.0%
+print(result.group_results["DE"].iterations)  # 15
+```
+
+#### Nested Weighting with `group_totals`
+
+Weight within groups AND adjust group sizes to global targets:
+
+```python
+# Weight age/gender within regions, then adjust region sizes
+weighted = rimpy.rake_by_scheme(
+    df,
+    schemes={
+        "North": {"age": {1: 15, 2: 85}, "gender": {1: 50, 2: 50}},
+        "South": {"age": {1: 10, 2: 90}, "gender": {1: 48, 2: 52}},
+    },
+    by="region",
+    group_totals={"North": 40, "South": 60},  # North=40%, South=60% of total
+)
+```
+
+Combine with `total` to also control the absolute weighted base:
+
+```python
+# Same proportions, but project to population of 10,000
+weighted = rimpy.rake_by_scheme(
+    df,
+    schemes={...},
+    by="region",
+    group_totals={"North": 40, "South": 60},
+    total=10_000,  # North≈4,000 + South≈6,000
+)
+```
+
+The order of operations is: (1) rake within each group → (2) apply `group_totals` → (3) scale to `total`.
+
+### `weight_summary(df, weight_col, by=None)`
+
+Summarize weight diagnostics, optionally by group.
+
+```python
+# Overall summary
+summary = rimpy.weight_summary(df, "weight")
+
+# By country
+summary = rimpy.weight_summary(df, "weight", by="country")
+```
+
+Returns DataFrame with:
+| Column | Description |
+|--------|-------------|
+| `n` | Sample size |
+| `effective_n` | Effective sample size after weighting |
+| `efficiency_pct` | Weighting efficiency (0-100%) |
+| `weight_mean` | Mean weight (should be ~1.0) |
+| `weight_std` | Standard deviation of weights |
+| `weight_median` | Median weight |
+| `weight_min` | Minimum weight |
+| `weight_max` | Maximum weight |
+| `weight_ratio` | Ratio of max to min weight |
+
+### `validate_targets(df, targets)`
+
+Check targets for errors before weighting.
+
+```python
+report = rimpy.validate_targets(df, targets)
+print(report["errors"])    # Critical issues (will crash)
+print(report["warnings"])  # Non-critical issues (informational)
+```
+
+### `validate_schemes(df, schemes, by)`
+
+Check schemes for errors before weighting with `rake_by_scheme()`.
+
+```python
+report = rimpy.validate_schemes(df, schemes, by="country")
+print(report["_global"]["errors"])
+print(report["US"]["warnings"])
+```
+
+## Loading Schemes from Files
+
+### `load_schemes(source, **options)`
+
+Load weighting schemes from a **long-format** table.
+
+```python
+schemes = rimpy.load_schemes("targets.xlsx")
+weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+
+# Custom column names
+schemes = rimpy.load_schemes(
+    "targets.xlsx",
+    key_col="country_id",
+    var_col="variable",
+    code_col="code",
+    target_col="pct",
+    sheet_name="Wave1",
+)
+```
+
+Expected input format:
+
+| scheme_key | target_var | target_code | target_pct |
+|------------|------------|-------------|------------|
+| 20230001   | gender     | 1           | 49.85      |
+| 20230001   | gender     | 2           | 49.85      |
+| 20230001   | gender     | 3           | 0.3        |
+| 20230001   | smoker     | 1           | 21         |
+| 20230001   | smoker     | 2           | 79         |
+
+### `load_schemes_wide(source, **options)`
+
+Load weighting schemes from a **wide-format** table.
+
+```python
+schemes = rimpy.load_schemes_wide("targets.xlsx")
+weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+```
+
+Expected input format:
+
+| target_var | target_code | 20230001 | 20240001 | 20230002 |
+|------------|-------------|----------|----------|----------|
+| gender     | 1           | 49.85    | 49.9     | 49.9     |
+| gender     | 2           | 49.85    | 49.9     | 49.9     |
+| gender     | 3           | 0.3      | 0.2      | 0.2      |
+| smoker     | 1           | 21       | 9        | 10       |
+| smoker     | 2           | 79       | 91       | 90       |
+
+## Target Formats
+
+rimpy accepts targets in two formats:
+
+```python
+# Dict format (preferred)
+targets = {
+    "gender": {1: 49, 2: 51},
+    "age": {1: 20, 2: 30, 3: 30, 4: 20},
+}
+
+# List format (weightipy-compatible)
+targets = [
+    {"gender": {1: 49, 2: 51}},
+    {"age": {1: 20, 2: 30, 3: 30, 4: 20}},
+]
+```
+
+Values can be proportions (0-1) or percentages (0-100). rimpy auto-detects.
+
+### Converting from weightipy
+
+```python
+# weightipy format
+weightipy_targets = {
+    20230001: [
+        {"gender": {1: 49.95, 2: 49.95, 3: 0.1}},
+        {"age": {1: 32, 2: 37, 3: 31}},
+    ],
+}
+
+# Convert to rimpy format
+schemes = rimpy.convert_from_weightipy(weightipy_targets)
+weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+```
+
+## Performance
+
+rimpy uses a Rust engine (via PyO3) for the core raking loop, with automatic fallback to pure Python/NumPy on unsupported platforms. Benchmark on synthetic survey data:
+
+| Scenario | Python/NumPy | Rust | Speedup |
+|----------|-------------|------|---------|
+| Small survey (n=500, 3 vars) | 0.25 ms | 0.03 ms | **8.7x** |
+| Medium survey (n=5,000, 5 vars) | 1.48 ms | 0.44 ms | **3.3x** |
+| Large survey (n=50,000, 5 vars) | 8.66 ms | 5.83 ms | **1.5x** |
+| 25 countries × 5,000 each (parallel) | 38.40 ms | 5.72 ms | **6.7x** |
+
+The biggest gains come from grouped raking (multi-country surveys), where Rayon parallelizes across groups.
+
+## How It Works
+
+rimpy implements iterative proportional fitting (IPF/raking):
+
+1. **Preprocessing**: Uses narwhals for backend-agnostic DataFrame operations
+2. **Index caching**: Pre-computes row indices for each target category
+3. **Iteration**: Rust engine with zero-allocation inner loop (falls back to NumPy if needed)
+4. **Parallel groups**: Multi-country raking runs across CPU cores via Rayon
+5. **Output**: Returns DataFrame in same format as input (polars in → polars out)
+
+## License
+
+MIT
