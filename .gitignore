@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Compiled Python extensions (built by maturin)
+*.pyd
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# IDE
+.idea/
+.vscode/
