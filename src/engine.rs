@@ -302,7 +302,6 @@ pub fn rim_iterate(
     // Convergence tracking
     let pct_still = 1.0 - opts.convergence_threshold;
     let mut diff_error = f64::INFINITY;
-    let mut diff_error_old = f64::INFINITY;
     let mut converged = false;
     let mut iteration = 0;
 
@@ -315,12 +314,6 @@ pub fn rim_iterate(
         // Save current weights (memcpy, no allocation)
         old_weights.copy_from_slice(&weights);
 
-        // Check convergence (no improvement)
-        if iter > 1 && diff_error >= pct_still * diff_error_old {
-            converged = diff_error < opts.convergence_threshold;
-            break;
-        }
-
         // Rake on each variable
         for (col, props) in &normalized {
             rake_on_variable(&mut weights, &index_caches[col], props, n_f64);
@@ -330,12 +323,25 @@ pub fn rim_iterate(
         apply_caps(&mut weights, effective_min_cap, effective_max_cap);
 
         // Convergence metric: sum of absolute differences
-        diff_error_old = diff_error;
-        diff_error = weights
+        let new_diff_error: f64 = weights
             .iter()
             .zip(old_weights.iter())
             .map(|(w, o)| (w - o).abs())
             .sum();
+
+        // Converged if error below threshold
+        if new_diff_error < opts.convergence_threshold {
+            converged = true;
+            break;
+        }
+
+        // Converged if weights have stabilized (progress stalled)
+        if iter > 1 && new_diff_error >= pct_still * diff_error {
+            converged = true;
+            break;
+        }
+
+        diff_error = new_diff_error;
     }
 
     // Replace zeros with 1.0
