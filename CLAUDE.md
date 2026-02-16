@@ -46,6 +46,15 @@ python -m maturin build --release
 uv pip install target/wheels/rimpy-*.whl --reinstall --python /path/to/other/.venv/Scripts/python
 ```
 
+## Design Rationale
+
+- **Zero API changes**: `_rake.py` imports `from ._engine import RakeResult, rim_iterate` — the shim handles Rust vs Python transparently. Users see no difference.
+- **Graceful fallback**: No Rust compiler? Pure Python still works. Check with `rimpy._engine.get_backend()`.
+- **Why raw `Vec<f64>` in Rust**: RIM's core is indexed gather/scatter on a 1D array. Plain slices let LLVM auto-vectorize with SIMD. The hot loop does zero heap allocations (`old_weights` buffer is pre-allocated and reused).
+- **Why Rayon for grouped raking**: Each group gets its own weights vector — no shared mutable state. Embarrassingly parallel with near-linear speedup.
+- **Data ingress**: NumPy arrays via `pyo3-numpy` (near-zero-copy for contiguous arrays). Future: Arrow FFI for zero-copy from Polars.
+- **What stays in Python**: `_rake.py` (orchestration, not a bottleneck), `_loaders.py` (I/O bound), `__init__.py` (public API).
+
 ## Known Gotchas
 
 - **Locked .pyd file**: If `maturin develop` fails with "file being used by another process", rename the .pyd first: `mv ...pyd ...pyd.old`, then rebuild.
