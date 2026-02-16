@@ -31,7 +31,7 @@ Pre-built wheels are available for Linux, Windows, and macOS (arm64) on Python 3
 
 ```python
 import polars as pl
-import rimpy
+import rimpy as rim
 
 # Your survey data (works with pandas too!)
 df = pl.DataFrame({
@@ -46,7 +46,7 @@ targets = {
 }
 
 # Apply weights - returns same type as input
-weighted = rimpy.rake(df, targets)
+weighted = rim.rake(df, targets)
 print(weighted["weight"])
 ```
 
@@ -57,7 +57,7 @@ print(weighted["weight"])
 Apply RIM weights to a DataFrame.
 
 ```python
-weighted = rimpy.rake(
+weighted = rim.rake(
     df,                          # polars or pandas DataFrame
     targets,                     # dict of target proportions
     max_iterations=1000,         # max iterations before stopping
@@ -77,7 +77,7 @@ Scale weights so the weighted sum equals a target population size:
 
 ```python
 # 500 respondents projected to a population of 50,000
-weighted = rimpy.rake(df, targets, total=50_000)
+weighted = rim.rake(df, targets, total=50_000)
 weighted["weight"].sum()  # ≈ 50,000
 ```
 
@@ -88,7 +88,7 @@ Rows excluded from raking (e.g., nulls with `drop_nulls=True`) keep weight=1.0 a
 Same as `rake()` but also returns diagnostics.
 
 ```python
-weighted, result = rimpy.rake_with_diagnostics(df, targets)
+weighted, result = rim.rake_with_diagnostics(df, targets)
 
 print(result.converged)      # True/False
 print(result.iterations)     # Number of iterations
@@ -105,14 +105,14 @@ Apply weights separately within groups (same targets for all groups).
 
 ```python
 # Weight gender/age within each country
-weighted = rimpy.rake_by(
+weighted = rim.rake_by(
     df,
     targets={"gender": {1: 50, 2: 50}, "age": {1: 30, 2: 40, 3: 30}},
     by="country",  # or by=["country", "region"]
 )
 
 # With controlled total across all groups
-weighted = rimpy.rake_by(
+weighted = rim.rake_by(
     df,
     targets={"gender": {1: 50, 2: 50}, "age": {1: 30, 2: 40, 3: 30}},
     by="country",
@@ -144,10 +144,10 @@ country_schemes = {
     },
 }
 
-weighted = rimpy.rake_by_scheme(df, country_schemes, by="country")
+weighted = rim.rake_by_scheme(df, country_schemes, by="country")
 
 # With diagnostics
-weighted, result = rimpy.rake_by_scheme_with_diagnostics(df, country_schemes, by="country")
+weighted, result = rim.rake_by_scheme_with_diagnostics(df, country_schemes, by="country")
 print(result.group_results["US"].efficiency)  # 90.0%
 print(result.group_results["DE"].iterations)  # 15
 ```
@@ -158,7 +158,7 @@ Weight within groups AND adjust group sizes to global targets:
 
 ```python
 # Weight age/gender within regions, then adjust region sizes
-weighted = rimpy.rake_by_scheme(
+weighted = rim.rake_by_scheme(
     df,
     schemes={
         "North": {"age": {1: 15, 2: 85}, "gender": {1: 50, 2: 50}},
@@ -173,7 +173,7 @@ Combine with `total` to also control the absolute weighted base:
 
 ```python
 # Same proportions, but project to population of 10,000
-weighted = rimpy.rake_by_scheme(
+weighted = rim.rake_by_scheme(
     df,
     schemes={...},
     by="region",
@@ -190,10 +190,10 @@ Summarize weight diagnostics, optionally by group.
 
 ```python
 # Overall summary
-summary = rimpy.weight_summary(df, "weight")
+summary = rim.weight_summary(df, "weight")
 
 # By country
-summary = rimpy.weight_summary(df, "weight", by="country")
+summary = rim.weight_summary(df, "weight", by="country")
 ```
 
 Returns DataFrame with:
@@ -214,7 +214,7 @@ Returns DataFrame with:
 Check targets for errors before weighting.
 
 ```python
-report = rimpy.validate_targets(df, targets)
+report = rim.validate_targets(df, targets)
 print(report["errors"])    # Critical issues (will crash)
 print(report["warnings"])  # Non-critical issues (informational)
 ```
@@ -224,7 +224,7 @@ print(report["warnings"])  # Non-critical issues (informational)
 Check schemes for errors before weighting with `rake_by_scheme()`.
 
 ```python
-report = rimpy.validate_schemes(df, schemes, by="country")
+report = rim.validate_schemes(df, schemes, by="country")
 print(report["_global"]["errors"])
 print(report["US"]["warnings"])
 ```
@@ -236,11 +236,11 @@ print(report["US"]["warnings"])
 Load weighting schemes from a **long-format** table.
 
 ```python
-schemes = rimpy.load_schemes("targets.xlsx")
-weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+schemes = rim.load_schemes("targets.xlsx")
+weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 
 # Custom column names
-schemes = rimpy.load_schemes(
+schemes = rim.load_schemes(
     "targets.xlsx",
     key_col="country_id",
     var_col="variable",
@@ -265,8 +265,8 @@ Expected input format:
 Load weighting schemes from a **wide-format** table.
 
 ```python
-schemes = rimpy.load_schemes_wide("targets.xlsx")
-weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+schemes = rim.load_schemes_wide("targets.xlsx")
+weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 ```
 
 Expected input format:
@@ -311,8 +311,8 @@ weightipy_targets = {
 }
 
 # Convert to rimpy format
-schemes = rimpy.convert_from_weightipy(weightipy_targets)
-weighted = rimpy.rake_by_scheme(df, schemes, by="country_code")
+schemes = rim.convert_from_weightipy(weightipy_targets)
+weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 ```
 
 ## Performance
