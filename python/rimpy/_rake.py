@@ -43,7 +43,7 @@ def _extract_columns_to_numpy(
     for col in columns:
         # Get the column and convert to numpy
         series = df[col]
-        result[col] = series.to_numpy()
+        result[col] = np.ascontiguousarray(series.to_numpy(), dtype=np.int64)
     return result
 
 

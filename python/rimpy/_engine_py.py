@@ -155,16 +155,11 @@ def rim_iterate(
 
     pct_still = 1 - convergence_threshold
     diff_error = float("inf")
-    diff_error_old = float("inf")
     converged = False
     iteration = 0
 
     for iteration in range(1, max_iterations + 1):
         old_weights = weights.copy()
-
-        if diff_error >= pct_still * diff_error_old and iteration > 1:
-            converged = diff_error < convergence_threshold
-            break
 
         for col, props in normalized_targets.items():
             weights = rake_on_variable(weights, index_caches[col], props, n_rows)
@@ -172,10 +167,19 @@ def rim_iterate(
         if effective_min_cap is not None or effective_max_cap is not None:
             weights = apply_caps(weights, effective_min_cap, effective_max_cap)
 
-        diff_error_old = diff_error
-        diff_error = np.abs(weights - old_weights).sum()
-    else:
-        converged = False
+        new_diff_error = np.abs(weights - old_weights).sum()
+
+        # Converged if error below threshold
+        if new_diff_error < convergence_threshold:
+            converged = True
+            break
+
+        # Converged if weights have stabilized (progress stalled)
+        if iteration > 1 and new_diff_error >= pct_still * diff_error:
+            converged = True
+            break
+
+        diff_error = new_diff_error
 
     weights = np.where(weights == 0, 1.0, weights)
 

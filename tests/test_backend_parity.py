@@ -133,3 +133,71 @@ class TestBackendParity:
             convergence_threshold=0.001,
             max_iterations=5000,
         )
+
+    def test_near_zero_targets_converge(self):
+        """Groups with near-zero targets (e.g. gender=3 at 0.1%) should converge
+        via stall detection rather than running to max_iterations."""
+        rng = np.random.default_rng(99)
+        n = 500
+        data = {
+            "gender": rng.choice([1, 2, 3], size=n, p=[0.48, 0.48, 0.04]).astype(np.int64),
+            "age": rng.integers(1, 4, size=n).astype(np.int64),
+        }
+        targets = {
+            "gender": {1: 49.9, 2: 49.9, 3: 0.2},
+            "age": {1: 33.0, 2: 34.0, 3: 33.0},
+        }
+        rs_result = rs_rim_iterate(data, targets)
+        py_result = py_rim_iterate(data, targets)
+
+        assert rs_result.converged, f"Rust: converged=False after {rs_result.iterations} iterations"
+        assert py_result.converged, f"Python: converged=False after {py_result.iterations} iterations"
+        assert rs_result.iterations < 50, f"Rust took {rs_result.iterations} iterations (expected <50)"
+        assert py_result.iterations < 50, f"Python took {py_result.iterations} iterations (expected <50)"
+
+    def test_int32_dtype_arrays(self):
+        """Polars when().then(int) produces Int32 arrays. The Rust engine must
+        handle int32 numpy arrays (cast via np.ascontiguousarray in _rake.py)."""
+        data_i32 = {
+            "gender": np.array([1, 1, 2, 2, 1], dtype=np.int32),
+            "age": np.array([1, 2, 1, 2, 1], dtype=np.int32),
+        }
+        data_i64 = {k: v.astype(np.int64) for k, v in data_i32.items()}
+        targets = {
+            "gender": {1: 50.0, 2: 50.0},
+            "age": {1: 40.0, 2: 60.0},
+        }
+
+        # int64 should work directly with Rust
+        rs_result = rs_rim_iterate(data_i64, targets)
+        assert rs_result.converged
+
+        # int32 would fail without the dtype cast in _extract_columns_to_numpy
+        py_result = py_rim_iterate(data_i32, targets)
+        assert py_result.converged
+        np.testing.assert_allclose(
+            np.array(rs_result.weights), py_result.weights, rtol=1e-6,
+        )
+
+
+@pytest.mark.skipif(not HAS_RUST, reason="Rust backend not compiled")
+class TestRakeResultConstruction:
+    """Verify RakeResult can be instantiated from Python (requires #[new])."""
+
+    def test_create_from_python(self):
+        from rimpy._rimpy_engine import RakeResult
+        r = RakeResult(
+            weights=np.array([1.0, 1.5, 0.5], dtype=np.float64),
+            iterations=5,
+            converged=True,
+            efficiency=90.0,
+            weight_min=0.5,
+            weight_max=1.5,
+        )
+        assert r.converged is True
+        assert r.iterations == 5
+        assert r.efficiency == 90.0
+        assert r.weight_min == 0.5
+        assert r.weight_max == 1.5
+        assert r.weight_ratio == 3.0
+        assert len(r.weights) == 3

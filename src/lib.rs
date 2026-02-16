@@ -43,6 +43,26 @@ struct PyRakeResult {
 
 #[pymethods]
 impl PyRakeResult {
+    #[new]
+    #[pyo3(signature = (weights, iterations, converged, efficiency, weight_min, weight_max))]
+    fn new(
+        weights: Py<PyArray1<f64>>,
+        iterations: usize,
+        converged: bool,
+        efficiency: f64,
+        weight_min: f64,
+        weight_max: f64,
+    ) -> Self {
+        PyRakeResult {
+            weights,
+            iterations,
+            converged,
+            efficiency,
+            weight_min,
+            weight_max,
+        }
+    }
+
     /// Ratio of max to min weight.
     #[getter]
     fn weight_ratio(&self) -> f64 {
