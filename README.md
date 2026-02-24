@@ -1,7 +1,7 @@
 # rimpy
 
 <p align="center">
-  <img src="images/rimpy-banner-v3.svg" alt="rimpy banner" width="100%">
+  <img src="https://raw.githubusercontent.com/albertxli/rimpy/main/images/rimpy-banner-v3.svg" alt="rimpy banner" width="100%">
 </p>
 
 **Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narwhals.**
