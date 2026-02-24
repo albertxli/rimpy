@@ -10,41 +10,10 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------
-  # Run tests before building
-  # ---------------------------------------------------------------
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Create venv and install dependencies
-        run: |
-          uv venv
-          uv pip install maturin pytest polars pandas pyarrow narwhals
-
-      - name: Build and install
-        run: uv run maturin develop --release
-
-      - name: Run tests
-        run: uv run pytest tests/ -v
-
-  # ---------------------------------------------------------------
   # Build wheels for each OS × Python version
   # ---------------------------------------------------------------
   build:
     name: Build / ${{ matrix.os }} / ${{ matrix.python }}
-    needs: [test]
     strategy:
       fail-fast: false
       matrix:
