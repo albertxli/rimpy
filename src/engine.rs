@@ -3,9 +3,9 @@
 //! All computation uses plain slices — no ndarray, no Arrow.
 //! The compiler auto-vectorizes the inner loops with SIMD.
 
+use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use indexmap::IndexMap;
 
 /// Result of a single raking operation.
 #[derive(Debug, Clone)]
@@ -19,6 +19,7 @@ pub struct RakeResult {
 }
 
 impl RakeResult {
+    #[allow(dead_code)]
     pub fn weight_ratio(&self) -> f64 {
         if self.weight_min > 0.0 {
             self.weight_max / self.weight_min
@@ -129,17 +130,17 @@ fn apply_caps(weights: &mut [f64], min_cap: Option<f64>, max_cap: Option<f64>) {
         let mut changed = false;
 
         for w in weights.iter_mut() {
-            if let Some(cap) = max_cap {
-                if *w > cap {
-                    *w = cap;
-                    changed = true;
-                }
+            if let Some(cap) = max_cap
+                && *w > cap
+            {
+                *w = cap;
+                changed = true;
             }
-            if let Some(cap) = min_cap {
-                if *w < cap {
-                    *w = cap;
-                    changed = true;
-                }
+            if let Some(cap) = min_cap
+                && *w < cap
+            {
+                *w = cap;
+                changed = true;
             }
         }
 
@@ -279,20 +280,12 @@ pub fn rim_iterate(
     let n_f64 = n as f64;
 
     // Apply cap correction
-    let effective_max_cap = opts.max_cap.map(|c| {
-        if opts.cap_correction {
-            c + 0.0001
-        } else {
-            c
-        }
-    });
-    let effective_min_cap = opts.min_cap.map(|c| {
-        if opts.cap_correction {
-            c - 0.0001
-        } else {
-            c
-        }
-    });
+    let effective_max_cap = opts
+        .max_cap
+        .map(|c| if opts.cap_correction { c + 0.0001 } else { c });
+    let effective_min_cap = opts
+        .min_cap
+        .map(|c| if opts.cap_correction { c - 0.0001 } else { c });
 
     // Convergence tracking
     let pct_still = 1.0 - opts.convergence_threshold;
@@ -385,14 +378,8 @@ mod tests {
         column_data.insert("age".to_string(), age.as_slice());
 
         let mut targets = IndexMap::new();
-        targets.insert(
-            "gender".to_string(),
-            HashMap::from([(1, 50.0), (2, 50.0)]),
-        );
-        targets.insert(
-            "age".to_string(),
-            HashMap::from([(1, 40.0), (2, 60.0)]),
-        );
+        targets.insert("gender".to_string(), HashMap::from([(1, 50.0), (2, 50.0)]));
+        targets.insert("age".to_string(), HashMap::from([(1, 40.0), (2, 60.0)]));
 
         let opts = RakeOpts::default();
         let result = rim_iterate(&column_data, &targets, &opts).unwrap();
@@ -420,10 +407,7 @@ mod tests {
         column_data.insert("gender".to_string(), gender.as_slice());
 
         let mut targets = IndexMap::new();
-        targets.insert(
-            "gender".to_string(),
-            HashMap::from([(1, 50.0), (2, 50.0)]),
-        );
+        targets.insert("gender".to_string(), HashMap::from([(1, 50.0), (2, 50.0)]));
 
         let opts = RakeOpts {
             max_cap: Some(3.0),

@@ -1,6 +1,6 @@
 [project]
 name = "rimpy"
-version = "0.2.0"
+version = "0.2.1"
 description = "Super fast rust-powered RIM (raking) survey weighting with narwhals - supports polars and pandas"
 readme = "README.md"
 license = "MIT"

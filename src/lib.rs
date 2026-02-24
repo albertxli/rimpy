@@ -52,8 +52,9 @@ fn arrow_from_pycapsule(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Rec
     let schema = reader.schema();
     let mut batches: Vec<RecordBatch> = Vec::new();
     for batch_result in reader {
-        let batch = batch_result
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Arrow batch error: {e}")))?;
+        let batch = batch_result.map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Arrow batch error: {e}"))
+        })?;
         batches.push(batch);
     }
 
@@ -142,10 +143,7 @@ impl PyRakeResult {
         let mut m = HashMap::new();
         m.insert("n_valid".into(), self.n_valid as f64);
         m.insert("iterations".into(), self.iterations as f64);
-        m.insert(
-            "converged".into(),
-            if self.converged { 1.0 } else { 0.0 },
-        );
+        m.insert("converged".into(), if self.converged { 1.0 } else { 0.0 });
         m.insert(
             "efficiency".into(),
             (self.efficiency * 100.0).round() / 100.0,
@@ -168,7 +166,12 @@ impl PyRakeResult {
     fn __repr__(&self) -> String {
         format!(
             "RakeResult(n_valid={}, iterations={}, converged={}, efficiency={:.2}%, weights=[{:.4}..{:.4}])",
-            self.n_valid, self.iterations, self.converged, self.efficiency, self.weight_min, self.weight_max,
+            self.n_valid,
+            self.iterations,
+            self.converged,
+            self.efficiency,
+            self.weight_min,
+            self.weight_max,
         )
     }
 }
@@ -218,6 +221,7 @@ fn extract_targets(targets: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, Has
     total = None,
     cap_correction = true,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn rim_rake(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -251,7 +255,7 @@ fn rim_rake(
         drop_nulls,
         total,
     )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     Ok((
         PyArrowData {
@@ -287,6 +291,7 @@ fn rim_rake(
     total = None,
     cap_correction = true,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn rim_rake_grouped(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -322,7 +327,7 @@ fn rim_rake_grouped(
         drop_nulls,
         total,
     )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     // Convert Vec<GroupRakeResult> → PyDict of PyRakeResult
     let output_dict = PyDict::new(py);
@@ -366,6 +371,7 @@ fn rim_rake_grouped(
     total = None,
     cap_correction = true,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn rim_rake_by_scheme(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -436,7 +442,7 @@ fn rim_rake_by_scheme(
         parsed_group_totals.as_ref(),
         total,
     )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     // Convert Vec<GroupRakeResult> → PyDict of PyRakeResult
     let output_dict = PyDict::new(py);

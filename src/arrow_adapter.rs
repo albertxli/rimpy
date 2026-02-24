@@ -76,7 +76,10 @@ pub fn extract_i64_column(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64
 
 /// Build a null/valid mask from Arrow null bitmaps for the given columns.
 /// Returns a boolean vec: `true` = valid (no nulls in any target column).
-pub fn build_valid_mask(batch: &RecordBatch, target_columns: &[String]) -> Result<Vec<bool>, String> {
+pub fn build_valid_mask(
+    batch: &RecordBatch,
+    target_columns: &[String],
+) -> Result<Vec<bool>, String> {
     let n_rows = batch.num_rows();
     let mut valid = vec![true; n_rows];
 
@@ -87,9 +90,9 @@ pub fn build_valid_mask(batch: &RecordBatch, target_columns: &[String]) -> Resul
             .map_err(|_| format!("Column '{col_name}' not found"))?;
         let array = batch.column(col_idx);
         if let Some(nulls) = array.nulls() {
-            for i in 0..n_rows {
+            for (i, v) in valid.iter_mut().enumerate() {
                 if !nulls.is_valid(i) {
-                    valid[i] = false;
+                    *v = false;
                 }
             }
         }
@@ -288,23 +291,23 @@ pub fn rake_on_batch(
     }
 
     // Scale to total
-    if let Some(target_total) = total {
-        if target_total > 0.0 {
-            let current_sum: f64 = if n_valid == n_rows {
-                full_weights.iter().sum()
+    if let Some(target_total) = total
+        && target_total > 0.0
+    {
+        let current_sum: f64 = if n_valid == n_rows {
+            full_weights.iter().sum()
+        } else {
+            valid_indices.iter().map(|&i| full_weights[i]).sum()
+        };
+        if current_sum > 0.0 {
+            let factor = target_total / current_sum;
+            if n_valid == n_rows {
+                for w in full_weights.iter_mut() {
+                    *w *= factor;
+                }
             } else {
-                valid_indices.iter().map(|&i| full_weights[i]).sum()
-            };
-            if current_sum > 0.0 {
-                let factor = target_total / current_sum;
-                if n_valid == n_rows {
-                    for w in full_weights.iter_mut() {
-                        *w *= factor;
-                    }
-                } else {
-                    for &i in &valid_indices {
-                        full_weights[i] *= factor;
-                    }
+                for &i in &valid_indices {
+                    full_weights[i] *= factor;
                 }
             }
         }
@@ -326,6 +329,7 @@ pub struct GroupRakeResult {
 }
 
 /// Single-group raking. Returns RecordBatch with weight column appended + diagnostics.
+#[allow(clippy::too_many_arguments)]
 pub fn rake_batch(
     batch: &RecordBatch,
     target_columns: &[String],
@@ -345,6 +349,7 @@ pub fn rake_batch(
 ///
 /// Partitions rows by group column(s), rakes each group in parallel via rayon,
 /// assembles a single weight column.
+#[allow(clippy::too_many_arguments)]
 pub fn rake_batch_grouped(
     batch: &RecordBatch,
     target_columns: &[String],
@@ -382,8 +387,14 @@ pub fn rake_batch_grouped(
     let group_results: Vec<(String, Vec<usize>, RakeResult)> = group_entries
         .into_par_iter()
         .map(|(key, row_indices)| {
-            let (valid_indices, result) =
-                rake_group(&row_indices, &all_columns, target_columns, targets, &valid_mask, opts)?;
+            let (valid_indices, result) = rake_group(
+                &row_indices,
+                &all_columns,
+                target_columns,
+                targets,
+                &valid_mask,
+                opts,
+            )?;
             let _ = valid_indices; // used for weight scattering below
             Ok((key, row_indices, result))
         })
@@ -414,14 +425,14 @@ pub fn rake_batch_grouped(
     }
 
     // Scale to total
-    if let Some(target_total) = total {
-        if target_total > 0.0 {
-            let current_sum: f64 = full_weights.iter().sum();
-            if current_sum > 0.0 {
-                let factor = target_total / current_sum;
-                for w in full_weights.iter_mut() {
-                    *w *= factor;
-                }
+    if let Some(target_total) = total
+        && target_total > 0.0
+    {
+        let current_sum: f64 = full_weights.iter().sum();
+        if current_sum > 0.0 {
+            let factor = target_total / current_sum;
+            for w in full_weights.iter_mut() {
+                *w *= factor;
             }
         }
     }
@@ -433,6 +444,7 @@ pub fn rake_batch_grouped(
 /// Per-group scheme raking with different targets per group.
 ///
 /// Handles `group_totals` (nested weighting) and global `total` scaling.
+#[allow(clippy::too_many_arguments)]
 pub fn rake_batch_by_scheme(
     batch: &RecordBatch,
     group_column: &str,
@@ -574,14 +586,14 @@ pub fn rake_batch_by_scheme(
     }
 
     // Scale to global total
-    if let Some(target_total) = total {
-        if target_total > 0.0 {
-            let current_sum: f64 = full_weights.iter().sum();
-            if current_sum > 0.0 {
-                let factor = target_total / current_sum;
-                for w in full_weights.iter_mut() {
-                    *w *= factor;
-                }
+    if let Some(target_total) = total
+        && target_total > 0.0
+    {
+        let current_sum: f64 = full_weights.iter().sum();
+        if current_sum > 0.0 {
+            let factor = target_total / current_sum;
+            for w in full_weights.iter_mut() {
+                *w *= factor;
             }
         }
     }
