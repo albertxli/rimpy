@@ -117,7 +117,7 @@ fn rake_on_variable(
 // Weight capping with renormalization
 // ---------------------------------------------------------------------------
 
-/// Apply min/max caps and renormalize. In-place, zero allocations.
+/// Apply min/max caps and renormalize. In-place, single-pass per cap.
 fn apply_caps(weights: &mut [f64], min_cap: Option<f64>, max_cap: Option<f64>) {
     if min_cap.is_none() && max_cap.is_none() {
         return;
@@ -127,26 +127,26 @@ fn apply_caps(weights: &mut [f64], min_cap: Option<f64>, max_cap: Option<f64>) {
         let mut changed = false;
 
         if let Some(cap) = max_cap {
-            let max_w = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            if max_w > cap {
-                for w in weights.iter_mut() {
-                    if *w > cap {
-                        *w = cap;
-                    }
+            for w in weights.iter_mut() {
+                if *w > cap {
+                    *w = cap;
+                    changed = true;
                 }
+            }
+            if changed {
                 renormalize(weights);
-                changed = true;
             }
         }
 
         if let Some(cap) = min_cap {
-            let min_w = weights.iter().cloned().fold(f64::INFINITY, f64::min);
-            if min_w < cap {
-                for w in weights.iter_mut() {
-                    if *w < cap {
-                        *w = cap;
-                    }
+            let mut min_changed = false;
+            for w in weights.iter_mut() {
+                if *w < cap {
+                    *w = cap;
+                    min_changed = true;
                 }
+            }
+            if min_changed {
                 renormalize(weights);
                 changed = true;
             }
@@ -232,31 +232,31 @@ pub fn rim_iterate(
     column_data: &HashMap<String, &[i64]>,
     targets: &IndexMap<String, HashMap<i64, f64>>,
     opts: &RakeOpts,
-) -> RakeResult {
+) -> Result<RakeResult, String> {
     // Determine n from first column
     let n = match column_data.values().next() {
         Some(col) => col.len(),
         None => {
-            return RakeResult {
+            return Ok(RakeResult {
                 weights: vec![],
                 iterations: 0,
                 converged: true,
                 efficiency: 100.0,
                 weight_min: 1.0,
                 weight_max: 1.0,
-            };
+            });
         }
     };
 
     if n == 0 {
-        return RakeResult {
+        return Ok(RakeResult {
             weights: vec![],
             iterations: 0,
             converged: true,
             efficiency: 100.0,
             weight_min: 1.0,
             weight_max: 1.0,
-        };
+        });
     }
 
     // Normalize targets
@@ -265,7 +265,7 @@ pub fn rim_iterate(
     // Validate columns exist
     for col in normalized.keys() {
         if !column_data.contains_key(col) {
-            panic!("Target column '{}' not found in data", col);
+            return Err(format!("Target column '{}' not found in data", col));
         }
     }
 
@@ -355,14 +355,14 @@ pub fn rim_iterate(
     let weight_min = weights.iter().cloned().fold(f64::INFINITY, f64::min);
     let weight_max = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-    RakeResult {
+    Ok(RakeResult {
         weights,
         iterations: iteration,
         converged,
         efficiency,
         weight_min,
         weight_max,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +381,7 @@ pub struct GroupData {
 pub fn rim_iterate_grouped<K: Send + Sync + Eq + std::hash::Hash + Clone>(
     groups: Vec<(K, GroupData)>,
     opts: &RakeOpts,
-) -> Vec<(K, RakeResult)> {
+) -> Result<Vec<(K, RakeResult)>, String> {
     use rayon::prelude::*;
 
     groups
@@ -394,8 +394,8 @@ pub fn rim_iterate_grouped<K: Send + Sync + Eq + std::hash::Hash + Clone>(
                 .map(|(k, v)| (k.clone(), v.as_slice()))
                 .collect();
 
-            let result = rim_iterate(&col_refs, &group.targets, opts);
-            (key, result)
+            let result = rim_iterate(&col_refs, &group.targets, opts)?;
+            Ok((key, result))
         })
         .collect()
 }
@@ -418,7 +418,7 @@ mod tests {
         column_data.insert("gender".to_string(), gender.as_slice());
         column_data.insert("age".to_string(), age.as_slice());
 
-        let mut targets = HashMap::new();
+        let mut targets = IndexMap::new();
         targets.insert(
             "gender".to_string(),
             HashMap::from([(1, 50.0), (2, 50.0)]),
@@ -429,7 +429,7 @@ mod tests {
         );
 
         let opts = RakeOpts::default();
-        let result = rim_iterate(&column_data, &targets, &opts);
+        let result = rim_iterate(&column_data, &targets, &opts).unwrap();
 
         assert!(result.converged);
         assert!(result.efficiency > 0.0);
@@ -453,7 +453,7 @@ mod tests {
         let mut column_data = HashMap::new();
         column_data.insert("gender".to_string(), gender.as_slice());
 
-        let mut targets = HashMap::new();
+        let mut targets = IndexMap::new();
         targets.insert(
             "gender".to_string(),
             HashMap::from([(1, 50.0), (2, 50.0)]),
@@ -464,7 +464,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = rim_iterate(&column_data, &targets, &opts);
+        let result = rim_iterate(&column_data, &targets, &opts).unwrap();
         // Max weight should respect the cap (with epsilon)
         assert!(result.weight_max <= 3.0 + 0.001);
     }
@@ -472,10 +472,10 @@ mod tests {
     #[test]
     fn test_empty_data() {
         let column_data: HashMap<String, &[i64]> = HashMap::new();
-        let targets = HashMap::new();
+        let targets = IndexMap::new();
         let opts = RakeOpts::default();
 
-        let result = rim_iterate(&column_data, &targets, &opts);
+        let result = rim_iterate(&column_data, &targets, &opts).unwrap();
         assert!(result.weights.is_empty());
         assert!(result.converged);
     }

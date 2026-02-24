@@ -33,17 +33,17 @@ classifiers = [
 ]
 dependencies = [
     "narwhals>=2.16.0",
-    "numpy>=2.4.2",
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
-polars = ["polars>=1.38.1"]
-pandas = ["pandas>=3.0.0"]
-all = ["polars>=1.38.1", "pandas>=3.0.0"]
+polars = ["polars>=1.0.0"]
+pandas = ["pandas>=2.0.0"]
+all = ["polars>=1.0.0", "pandas>=2.0.0"]
 dev = [
     "pytest>=9.0.2",
-    "pandas>=3.0.0",
-    "polars>=1.38.1",
+    "pandas>=2.0.0",
+    "polars>=1.0.0",
 ]
 
 [project.urls]

@@ -11,10 +11,8 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import polars as pl
-
 if TYPE_CHECKING:
-    pass
+    import polars as pl
 
 __all__ = ["load_schemes", "load_schemes_wide"]
 
@@ -97,6 +95,8 @@ def load_schemes(
       and code_col values match your actual data values.
     - Input row order doesn't matter—data is grouped internally.
     """
+    import polars as pl
+
     # Read source into polars DataFrame
     if isinstance(source, (str, Path)):
         source = Path(source)
@@ -215,6 +215,8 @@ def load_schemes_wide(
     - Types are preserved as-is. Ensure scheme key columns match your `by` column
       and code_col values match your actual data values.
     """
+    import polars as pl
+
     # Read source into polars DataFrame
     if isinstance(source, (str, Path)):
         source = Path(source)

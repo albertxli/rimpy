@@ -7,7 +7,7 @@ Supports both polars and pandas DataFrames transparently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import narwhals as nw
 import numpy as np
@@ -42,7 +42,7 @@ def _extract_columns_to_numpy(
     result = {}
     for col in columns:
         # Get the column and convert to numpy
-        series = df[col]
+        series = df.get_column(col)
         result[col] = np.ascontiguousarray(series.to_numpy(), dtype=np.int64)
     return result
 
@@ -53,24 +53,12 @@ def _add_weight_column(
     column_name: str,
 ) -> nw.DataFrame:
     """Add a numpy array as a new column to a narwhals DataFrame."""
-    # Get the native namespace (polars or pandas module)
-    ns = nw.get_native_namespace(df)
-
-    # Create native series - pandas and polars have different constructors
-    try:
-        # Try polars style first: Series(name, data)
-        import polars as pl
-        if ns is pl:
-            native_series = ns.Series(column_name, weights)
-        else:
-            raise ImportError
-    except (ImportError, TypeError):
-        # Pandas style: Series(data, name=name)
-        native_series = ns.Series(weights, name=column_name)
-
-    # Wrap in narwhals
-    nw_series = nw.from_native(native_series, series_only=True)
-    # Add to dataframe
+    nw_series = nw.new_series(
+        column_name,
+        weights,
+        dtype=nw.Float64,
+        backend=nw.get_native_namespace(df),
+    )
     return df.with_columns(nw_series)
 
 
@@ -247,7 +235,10 @@ def rake_with_diagnostics(
         valid_indices = None
     else:
         valid_indices = np.where(valid_mask)[0]
-        df_valid = df_nw.filter(nw.lit(valid_mask.tolist()))
+        # Filter to non-null rows using the negated null expression
+        df_valid = df_nw.filter(
+            ~nw.any_horizontal(*[nw.col(c).is_null() for c in target_columns], ignore_nulls=True)
+        )
         column_data = _extract_columns_to_numpy(df_valid, target_columns)
 
     # Run the core algorithm
@@ -415,7 +406,7 @@ def rake_by_with_diagnostics(
             continue
 
         # Get original indices
-        indices = df_group[idx_col].to_numpy()
+        indices = df_group.get_column(idx_col).to_numpy()
 
         # Handle nulls in target columns
         if drop_nulls:
@@ -437,7 +428,7 @@ def rake_by_with_diagnostics(
                 ~nw.any_horizontal(*[nw.col(c).is_null() for c in target_columns], ignore_nulls=True)
             )
             column_data = _extract_columns_to_numpy(valid_df, target_columns)
-            indices = valid_df[idx_col].to_numpy()
+            indices = valid_df.get_column(idx_col).to_numpy()
 
         result = rim_iterate(
             column_data=column_data,
@@ -668,7 +659,10 @@ def rake_by_scheme_with_diagnostics(
     full_weights = np.ones(n_rows, dtype=np.float64)
     group_results: dict[Any, RakeResult] = {}
 
-    unique_groups = df_nw[by].unique().to_numpy()
+    idx_col = "__rimpy_idx__"
+    df_with_idx = df_nw.with_row_index(idx_col)
+
+    unique_groups = df_nw.get_column(by).unique().to_numpy()
 
     for group_value in unique_groups:
         if group_value in schemes:
@@ -696,10 +690,7 @@ def rake_by_scheme_with_diagnostics(
                 f"Target columns {missing} for group '{group_value}' not found in DataFrame"
             )
 
-        # Add row index, then filter to group
-        idx_col = "__rimpy_idx__"
-        df_with_idx = df_nw.with_row_index(idx_col)
-        
+        # Filter to group
         if group_value is None:
             df_group = df_with_idx.filter(nw.col(by).is_null())
         else:
@@ -709,7 +700,7 @@ def rake_by_scheme_with_diagnostics(
             continue
             
         # Get original indices
-        indices = df_group[idx_col].to_numpy()
+        indices = df_group.get_column(idx_col).to_numpy()
 
         if drop_nulls:
             null_mask = df_group.select(
@@ -729,7 +720,7 @@ def rake_by_scheme_with_diagnostics(
                 ~nw.any_horizontal(*[nw.col(c).is_null() for c in target_columns], ignore_nulls=True)
             )
             column_data = _extract_columns_to_numpy(valid_df, target_columns)
-            indices = valid_df[idx_col].to_numpy()
+            indices = valid_df.get_column(idx_col).to_numpy()
 
         result = rim_iterate(
             column_data=column_data,
@@ -770,7 +761,7 @@ def rake_by_scheme_with_diagnostics(
             if len(df_group) == 0:
                 continue
 
-            indices = df_group[idx_col].to_numpy()
+            indices = df_group.get_column(idx_col).to_numpy()
 
             # Target weighted sum for this group
             target_sum = target_prop * n_rows
@@ -937,7 +928,7 @@ def validate_targets(
             continue
 
         # Check all codes exist (informational - only warn if target is non-zero)
-        unique_values = set(df_nw[col].unique().to_numpy())
+        unique_values = set(df_nw.get_column(col).unique().to_numpy())
         for code, target_value in props.items():
             if code not in unique_values and target_value != 0:
                 warnings.append(f"Code {code} in targets for '{col}' not found in data")
@@ -1019,7 +1010,7 @@ def validate_schemes(
         return result
 
     # Get unique group values in data
-    unique_groups = set(df_nw[by].unique().to_numpy())
+    unique_groups = set(df_nw.get_column(by).unique().to_numpy())
 
     # Check for groups in schemes that don't exist in data (informational)
     for group_key in schemes.keys():
@@ -1060,7 +1051,7 @@ def validate_schemes(
                 continue
 
             # Check all codes exist in this group's data (informational - only warn if target is non-zero)
-            unique_values = set(df_group[col].unique().to_numpy())
+            unique_values = set(df_group.get_column(col).unique().to_numpy())
             for code, target_value in props.items():
                 if code not in unique_values and target_value != 0:
                     group_warnings.append(

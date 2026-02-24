@@ -65,7 +65,7 @@ def rake_on_variable(
             continue
         target_count = target_prop * n_rows
         if target_count < 1e-10:
-            target_count = 1e-10
+            continue
         current_sum = weights[indices].sum()
         if current_sum > 0:
             multiplier = target_count / current_sum
@@ -80,16 +80,15 @@ def apply_caps(
 ) -> NDArray[np.float64]:
     if max_cap is None and min_cap is None:
         return weights
-    max_iter = 100
-    for _ in range(max_iter):
+    for _ in range(100):
         changed = False
         if max_cap is not None and weights.max() > max_cap:
-            weights = np.clip(weights, None, max_cap)
-            weights = weights / weights.mean()
+            np.clip(weights, None, max_cap, out=weights)
+            weights /= weights.mean()
             changed = True
         if min_cap is not None and weights.min() < min_cap:
-            weights = np.clip(weights, min_cap, None)
-            weights = weights / weights.mean()
+            np.clip(weights, min_cap, None, out=weights)
+            weights /= weights.mean()
             changed = True
         if not changed:
             break

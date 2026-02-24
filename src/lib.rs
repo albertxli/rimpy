@@ -7,7 +7,7 @@ mod engine;
 
 use std::collections::HashMap;
 
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -183,7 +183,8 @@ fn rim_iterate(
         .collect();
 
     // Run the engine
-    let result = engine::rim_iterate(&col_refs, &rust_targets, &opts);
+    let result = engine::rim_iterate(&col_refs, &rust_targets, &opts)
+        .map_err(|e| pyo3::exceptions::PyKeyError::new_err(e))?;
 
     // Convert weights to NumPy array
     let weights_array = PyArray1::from_vec(py, result.weights).unbind();
@@ -267,7 +268,8 @@ fn rim_iterate_grouped(
     }
 
     // Compute in parallel
-    let results = engine::rim_iterate_grouped(groups, &opts);
+    let results = engine::rim_iterate_grouped(groups, &opts)
+        .map_err(|e| pyo3::exceptions::PyKeyError::new_err(e))?;
 
     // Convert back to Python dict
     let output = PyDict::new(py);
