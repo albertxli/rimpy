@@ -7,7 +7,8 @@ and a country grouping variable for grouped tests.
 Run with: pytest tests/test_rake_functions.py -v
 """
 
-import numpy as np
+import random
+
 import pandas as pd
 import polars as pl
 import pytest
@@ -20,32 +21,31 @@ import rimpy
 # ---------------------------------------------------------------------------
 
 
+def _weighted_choices(population, weights, k, rng):
+    """Reproducible weighted random choices using stdlib random."""
+    return rng.choices(population, weights=weights, k=k)
+
+
 @pytest.fixture
 def survey_df_polars():
     """Realistic survey DataFrame (n=500) with demographic skew, polars."""
-    rng = np.random.default_rng(2024)
+    rng = random.Random(2024)
     n = 500
 
     # Gender: skewed 60/40 male-heavy (code 1=Male, 2=Female)
-    gender = rng.choice([1, 2], size=n, p=[0.60, 0.40]).astype(np.int64)
+    gender = _weighted_choices([1, 2], [0.60, 0.40], n, rng)
 
     # Age group: 1=18-29, 2=30-44, 3=45-59, 4=60+
-    age_group = rng.choice([1, 2, 3, 4], size=n, p=[0.30, 0.28, 0.25, 0.17]).astype(
-        np.int64
-    )
+    age_group = _weighted_choices([1, 2, 3, 4], [0.30, 0.28, 0.25, 0.17], n, rng)
 
     # Region: 1=Northeast, 2=Midwest, 3=South, 4=West
-    region = rng.choice([1, 2, 3, 4], size=n, p=[0.18, 0.21, 0.38, 0.23]).astype(
-        np.int64
-    )
+    region = _weighted_choices([1, 2, 3, 4], [0.18, 0.21, 0.38, 0.23], n, rng)
 
     # Income: 1=Under 30k, 2=30-60k, 3=60-100k, 4=Over 100k
-    income = rng.choice([1, 2, 3, 4], size=n, p=[0.22, 0.30, 0.28, 0.20]).astype(
-        np.int64
-    )
+    income = _weighted_choices([1, 2, 3, 4], [0.22, 0.30, 0.28, 0.20], n, rng)
 
     # Country: US/UK split (for grouped tests)
-    country = rng.choice(["US", "UK"], size=n, p=[0.60, 0.40])
+    country = _weighted_choices(["US", "UK"], [0.60, 0.40], n, rng)
 
     return pl.DataFrame(
         {
@@ -142,8 +142,8 @@ class TestRake:
         )
         result = rimpy.rake(df, demo_targets, drop_nulls=True)
         # First 10 rows should have weight=1.0
-        null_weights = result["weight"][:10].to_numpy()
-        assert np.allclose(null_weights, 1.0)
+        null_weights = result["weight"][:10].to_list()
+        assert all(abs(w - 1.0) < 1e-10 for w in null_weights)
 
     def test_proportions_and_percentages_match(self, survey_df_polars):
         """Percentage targets and proportion targets produce same weights."""
@@ -158,11 +158,11 @@ class TestRake:
         result_pct = rimpy.rake(survey_df_polars, targets_pct)
         result_prop = rimpy.rake(survey_df_polars, targets_prop)
 
-        np.testing.assert_allclose(
-            result_pct["weight"].to_numpy(),
-            result_prop["weight"].to_numpy(),
-            rtol=1e-6,
-        )
+        w_pct = result_pct["weight"].to_list()
+        w_prop = result_prop["weight"].to_list()
+        assert len(w_pct) == len(w_prop)
+        for a, b in zip(w_pct, w_prop):
+            assert abs(a - b) < 1e-6 * max(abs(a), 1.0)
 
     def test_pandas_input_returns_pandas(self, survey_df_pandas, demo_targets):
         """pandas DataFrame in → pandas DataFrame out."""
@@ -368,8 +368,8 @@ class TestRakeByScheme:
             survey_df_polars, schemes, by="country"
         )
         # UK has no scheme → weight=1.0
-        uk_weights = result.filter(pl.col("country") == "UK")["weight"]
-        assert np.allclose(uk_weights.to_numpy(), 1.0)
+        uk_weights = result.filter(pl.col("country") == "UK")["weight"].to_list()
+        assert all(abs(w - 1.0) < 1e-10 for w in uk_weights)
 
     def test_group_totals(self, survey_df_polars, country_schemes):
         """Nested weighting: within-group rake + group proportion adjustment."""

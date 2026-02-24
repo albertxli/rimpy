@@ -10,14 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module"] }
-numpy = "0.28"               # Zero-copy NumPy array access
+arrow = { version = "57", default-features = false, features = ["ffi"] }  # Arrow PyCapsule FFI
 rayon = "1.10"               # Parallel iteration for grouped raking
 indexmap = "2"               # Preserves insertion order like Python dict
-# arrow = { version = "54", optional = true }  # Future: zero-copy from Polars
-
-[features]
-default = []
-# arrow = ["dep:arrow"]  # Enable when ready for Arrow FFI path
 
 [profile.release]
 lto = "fat"                  # Fat LTO for cross-crate inlining

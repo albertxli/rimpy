@@ -1,14 +1,14 @@
 # rimpy
 
-**Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narhwlas.**
+**Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narwhals.**
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
 ## Features
 
-- 🚀 **Fast**: Rust-powered engine with pure Python/NumPy fallback
+- 🚀 **Fast**: Rust-powered Arrow engine with zero Python objects in the data path
 - 🔄 **Backend agnostic**: Works with both polars and pandas DataFrames via Narwhals
-- 📦 **Lightweight**: Only depends on narwhals and numpy
+- 📦 **Lightweight**: Only depends on narwhals (+ pyarrow for pandas users)
 - 🎯 **Simple API**: One function call to weight your data
 - ✅ **Inspiration**: Inspired by weightipy and check out their amazing work if you have more complex weighting needs
 
@@ -317,26 +317,29 @@ weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 
 ## Performance
 
-rimpy uses a Rust engine (via PyO3) for the core raking loop, with automatic fallback to pure Python/NumPy on unsupported platforms. Benchmark on synthetic survey data:
+rimpy uses a unified Arrow architecture: data flows from narwhals → Arrow PyCapsule → Rust → Arrow (with weight column appended) → narwhals, with zero Python objects in the hot path. Benchmark on synthetic survey data (polars backend):
 
-| Scenario | Python/NumPy | Rust | Speedup |
-|----------|-------------|------|---------|
-| Small survey (n=500, 3 vars) | 0.25 ms | 0.03 ms | **8.7x** |
-| Medium survey (n=5,000, 5 vars) | 1.48 ms | 0.44 ms | **3.3x** |
-| Large survey (n=50,000, 5 vars) | 8.66 ms | 5.83 ms | **1.5x** |
-| 25 countries × 5,000 each (parallel) | 38.40 ms | 5.72 ms | **6.7x** |
+| Scenario | Time |
+|----------|------|
+| Small survey (n=1,000, 3 vars) | 0.17 ms |
+| Medium survey (n=10,000, 3 vars) | 0.67 ms |
+| Large survey (n=100,000, 3 vars) | 10.60 ms |
+| Very large survey (n=1,000,000, 3 vars) | 126.14 ms |
+| Grouped raking (n=100,000, 10 groups) | 14.34 ms |
 
-The biggest gains come from grouped raking (multi-country surveys), where Rayon parallelizes across groups.
+Grouped raking uses Rayon to parallelize across groups.
 
 ## How It Works
 
 rimpy implements iterative proportional fitting (IPF/raking):
 
-1. **Preprocessing**: Uses narwhals for backend-agnostic DataFrame operations
-2. **Index caching**: Pre-computes row indices for each target category
-3. **Iteration**: Rust engine with zero-allocation inner loop (falls back to NumPy if needed)
-4. **Parallel groups**: Multi-country raking runs across CPU cores via Rayon
-5. **Output**: Returns DataFrame in same format as input (polars in → polars out)
+1. **Arrow ingestion**: narwhals wraps your DataFrame, Rust receives it via Arrow PyCapsule (zero-copy for polars)
+2. **Null detection**: Arrow null bitmaps identify rows to exclude (vectorized in Rust)
+3. **Index caching**: Pre-computes row indices for each target category
+4. **Iteration**: Rust engine with zero-allocation inner loop
+5. **Weight assembly**: Weight column appended to Arrow RecordBatch in Rust (existing columns Arc-shared)
+6. **Parallel groups**: Multi-country raking runs across CPU cores via Rayon
+7. **Output**: Arrow → narwhals → your original DataFrame type (polars in → polars out, pandas in → pandas out)
 
 ## License
 

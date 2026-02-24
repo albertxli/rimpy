@@ -1,34 +1,31 @@
 """
-Engine shim: Rust backend (fast) → pure Python/NumPy fallback.
+Engine shim: Rust backend via PyO3.
 
-This module provides the same interface regardless of which backend
-is active. The Rust engine is preferred for performance, but the
-pure Python implementation ensures rimpy works everywhere.
+The Rust engine is the sole compute path. No fallback.
+All data transfer uses Arrow PyCapsule Interface.
 """
 
 from __future__ import annotations
 
-import warnings
-from typing import TYPE_CHECKING, Any
+from ._rimpy_engine import (
+    RakeResult,
+    rim_rake,
+    rim_rake_by_scheme,
+    rim_rake_grouped,
+)
 
-try:
-    # Rust backend (compiled via maturin/PyO3)
-    from ._rimpy_engine import RakeResult, rim_iterate
-
-    BACKEND = "rust"
-except ImportError:
-    # Pure Python fallback (original implementation)
-    from ._engine_py import RakeResult, rim_iterate
-
-    BACKEND = "python"
-
-if TYPE_CHECKING:
-    pass
+BACKEND = "rust"
 
 
 def get_backend() -> str:
-    """Return which engine backend is active: 'rust' or 'python'."""
+    """Return the active engine backend (always 'rust')."""
     return BACKEND
 
 
-__all__ = ["RakeResult", "rim_iterate", "get_backend"]
+__all__ = [
+    "RakeResult",
+    "rim_rake",
+    "rim_rake_grouped",
+    "rim_rake_by_scheme",
+    "get_backend",
+]
