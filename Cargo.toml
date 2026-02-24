@@ -20,7 +20,7 @@ default = []
 # arrow = ["dep:arrow"]  # Enable when ready for Arrow FFI path
 
 [profile.release]
-lto = true                   # Link-time optimization for max speed
+lto = "fat"                  # Fat LTO for cross-crate inlining
 codegen-units = 1            # Single codegen unit = better optimization
 opt-level = 3
 strip = true

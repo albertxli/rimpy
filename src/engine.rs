@@ -3,6 +3,7 @@
 //! All computation uses plain slices — no ndarray, no Arrow.
 //! The compiler auto-vectorizes the inner loops with SIMD.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use indexmap::IndexMap;
 
@@ -117,7 +118,8 @@ fn rake_on_variable(
 // Weight capping with renormalization
 // ---------------------------------------------------------------------------
 
-/// Apply min/max caps and renormalize. In-place, single-pass per cap.
+/// Apply min/max caps and renormalize.
+/// Single scan applies both caps, then one renormalization per outer iteration.
 fn apply_caps(weights: &mut [f64], min_cap: Option<f64>, max_cap: Option<f64>) {
     if min_cap.is_none() && max_cap.is_none() {
         return;
@@ -126,35 +128,25 @@ fn apply_caps(weights: &mut [f64], min_cap: Option<f64>, max_cap: Option<f64>) {
     for _ in 0..100 {
         let mut changed = false;
 
-        if let Some(cap) = max_cap {
-            for w in weights.iter_mut() {
+        for w in weights.iter_mut() {
+            if let Some(cap) = max_cap {
                 if *w > cap {
                     *w = cap;
                     changed = true;
                 }
             }
-            if changed {
-                renormalize(weights);
-            }
-        }
-
-        if let Some(cap) = min_cap {
-            let mut min_changed = false;
-            for w in weights.iter_mut() {
+            if let Some(cap) = min_cap {
                 if *w < cap {
                     *w = cap;
-                    min_changed = true;
+                    changed = true;
                 }
-            }
-            if min_changed {
-                renormalize(weights);
-                changed = true;
             }
         }
 
         if !changed {
             break;
         }
+        renormalize(weights);
     }
 }
 
@@ -179,14 +171,16 @@ fn renormalize(weights: &mut [f64]) {
 
 /// Efficiency = (sum(w))^2 / (n * sum(w^2)) * 100
 /// Perfect weights (all 1.0) = 100%.
+/// Single-pass: computes sum and sum-of-squares simultaneously.
 pub fn calculate_efficiency(weights: &[f64]) -> f64 {
     let n = weights.len() as f64;
     if n == 0.0 {
         return 0.0;
     }
 
-    let sum_w: f64 = weights.iter().sum();
-    let sum_w_sq: f64 = weights.iter().map(|w| w * w).sum();
+    let (sum_w, sum_w_sq) = weights
+        .iter()
+        .fold((0.0, 0.0), |(s, sq), &w| (s + w, sq + w * w));
 
     if sum_w_sq == 0.0 {
         return 0.0;
@@ -200,20 +194,21 @@ pub fn calculate_efficiency(weights: &[f64]) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Normalize targets: if they sum > 1.5, treat as percentages and divide by 100.
+/// Uses Cow to avoid cloning when values are already proportions.
 fn normalize_targets(
     targets: &IndexMap<String, HashMap<i64, f64>>,
-) -> IndexMap<String, HashMap<i64, f64>> {
+) -> IndexMap<String, Cow<'_, HashMap<i64, f64>>> {
     targets
         .iter()
         .map(|(col, props)| {
             let total: f64 = props.values().sum();
-            let normalized = if total > 1.5 {
+            if total > 1.5 {
                 // Percentages → proportions
-                props.iter().map(|(&k, &v)| (k, v / 100.0)).collect()
+                let normalized = props.iter().map(|(&k, &v)| (k, v / 100.0)).collect();
+                (col.clone(), Cow::Owned(normalized))
             } else {
-                props.clone()
-            };
-            (col.clone(), normalized)
+                (col.clone(), Cow::Borrowed(props))
+            }
         })
         .collect()
 }
@@ -344,16 +339,22 @@ pub fn rim_iterate(
         diff_error = new_diff_error;
     }
 
-    // Replace zeros with 1.0
+    // Replace zeros with 1.0 and compute min/max in a single pass
+    let mut weight_min = f64::INFINITY;
+    let mut weight_max = f64::NEG_INFINITY;
     for w in weights.iter_mut() {
         if *w == 0.0 {
             *w = 1.0;
         }
+        if *w < weight_min {
+            weight_min = *w;
+        }
+        if *w > weight_max {
+            weight_max = *w;
+        }
     }
 
     let efficiency = calculate_efficiency(&weights);
-    let weight_min = weights.iter().cloned().fold(f64::INFINITY, f64::min);
-    let weight_max = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
     Ok(RakeResult {
         weights,
