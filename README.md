@@ -6,7 +6,10 @@
 
 **Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narwhals.**
 
+[![PyPI](https://img.shields.io/pypi/v/rimpy)](https://pypi.org/project/rimpy/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Rust](https://img.shields.io/badge/engine-Rust-orange.svg)](https://www.rust-lang.org/)
 
 ## Features
 
