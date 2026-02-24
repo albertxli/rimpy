@@ -57,6 +57,45 @@ weighted = rim.rake(df, targets)
 print(weighted["weight"])
 ```
 
+## Architecture
+
+rimpy uses a three-layer Rust design:
+
+```
+Python API  →  Narwhals (backend-agnostic DataFrames)
+                  │
+                  ▼  Arrow PyCapsule
+              Binding Layer (PyO3)
+                  │
+                  ▼
+              Arrow Middleware (language-agnostic)
+                  │
+                  ▼
+              RIM Engine (pure Rust)
+```
+
+The bottom two layers have zero Python dependencies — they can be reused by R, Julia, or any language with Arrow FFI support.
+
+## How It Works
+
+```
+df (polars/pandas) → narwhals → Arrow → RIM engine → Arrow → narwhals → df with weights
+```
+
+## Performance
+
+Benchmark on synthetic survey data (polars backend), zero Python objects in the hot path:
+
+| Scenario | Time |
+|----------|------|
+| Small survey (n=1,000, 3 vars) | 0.17 ms |
+| Medium survey (n=10,000, 3 vars) | 0.67 ms |
+| Large survey (n=100,000, 3 vars) | 10.60 ms |
+| Very large survey (n=1,000,000, 3 vars) | 126.14 ms |
+| Grouped raking (n=100,000, 10 groups) | 14.34 ms |
+
+Grouped raking uses Rayon to parallelize across groups.
+
 ## API Reference
 
 ### `rake(df, targets, **options)`
@@ -321,45 +360,6 @@ weightipy_targets = {
 schemes = rim.convert_from_weightipy(weightipy_targets)
 weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 ```
-
-## Architecture
-
-rimpy uses a three-layer Rust design:
-
-```
-Python API  →  Narwhals (backend-agnostic DataFrames)
-                  │
-                  ▼  Arrow PyCapsule
-              Binding Layer (PyO3)
-                  │
-                  ▼
-              Arrow Middleware (language-agnostic)
-                  │
-                  ▼
-              RIM Engine (pure Rust)
-```
-
-The bottom two layers have zero Python dependencies — they can be reused by R, Julia, or any language with Arrow FFI support.
-
-## How It Works
-
-```
-df (polars/pandas) → narwhals → Arrow → RIM engine → Arrow → narwhals → df with weights
-```
-
-## Performance
-
-Benchmark on synthetic survey data (polars backend), zero Python objects in the hot path:
-
-| Scenario | Time |
-|----------|------|
-| Small survey (n=1,000, 3 vars) | 0.17 ms |
-| Medium survey (n=10,000, 3 vars) | 0.67 ms |
-| Large survey (n=100,000, 3 vars) | 10.60 ms |
-| Very large survey (n=1,000,000, 3 vars) | 126.14 ms |
-| Grouped raking (n=100,000, 10 groups) | 14.34 ms |
-
-Grouped raking uses Rayon to parallelize across groups.
 
 ## License
 
