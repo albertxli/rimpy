@@ -329,17 +329,43 @@ rimpy uses a unified Arrow architecture: data flows from narwhals → Arrow PyCa
 
 Grouped raking uses Rayon to parallelize across groups.
 
+## Architecture
+
+rimpy uses a three-layer Rust design:
+
+```
+Python API  →  Narwhals (backend-agnostic DataFrames)
+                  │
+                  ▼  Arrow PyCapsule
+              Binding Layer (PyO3)
+                  │
+                  ▼
+              Arrow Middleware (language-agnostic)
+                  │
+                  ▼
+              Raking Engine (pure Rust)
+```
+
+The bottom two layers have zero Python dependencies — they can be reused by R, Julia, or any language with Arrow FFI support.
+
 ## How It Works
 
 rimpy implements iterative proportional fitting (IPF/raking):
 
-1. **Arrow ingestion**: narwhals wraps your DataFrame, Rust receives it via Arrow PyCapsule (zero-copy for polars)
-2. **Null detection**: Arrow null bitmaps identify rows to exclude (vectorized in Rust)
-3. **Index caching**: Pre-computes row indices for each target category
-4. **Iteration**: Rust engine with zero-allocation inner loop
-5. **Weight assembly**: Weight column appended to Arrow RecordBatch in Rust (existing columns Arc-shared)
-6. **Parallel groups**: Multi-country raking runs across CPU cores via Rayon
-7. **Output**: Arrow → narwhals → your original DataFrame type (polars in → polars out, pandas in → pandas out)
+1. Your DataFrame (polars or pandas) is passed to Rust via Apache Arrow (zero-copy)
+2. Null rows are detected and excluded automatically
+3. Row indices are pre-computed for each target category
+4. The engine iteratively adjusts weights until they match your target proportions
+5. Weight caps are applied if specified
+6. A weight column is appended and the result is returned as your original DataFrame type
+
+Grouped raking (`rake_by`, `rake_by_scheme`) parallelizes across groups via Rayon.
+
+Data flow:
+
+```
+df (polars/pandas) → narwhals → Arrow → Rust engine → Arrow → narwhals → df with weights
+```
 
 ## License
 

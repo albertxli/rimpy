@@ -367,41 +367,6 @@ pub fn rim_iterate(
 }
 
 // ---------------------------------------------------------------------------
-// Grouped raking (parallel via Rayon)
-// ---------------------------------------------------------------------------
-
-/// Data for a single group, ready for raking.
-pub struct GroupData {
-    pub column_data: HashMap<String, Vec<i64>>,
-    pub targets: IndexMap<String, HashMap<i64, f64>>,
-}
-
-/// Rake multiple groups in parallel using Rayon.
-///
-/// Returns a map of group_key → RakeResult.
-pub fn rim_iterate_grouped<K: Send + Sync + Eq + std::hash::Hash + Clone>(
-    groups: Vec<(K, GroupData)>,
-    opts: &RakeOpts,
-) -> Result<Vec<(K, RakeResult)>, String> {
-    use rayon::prelude::*;
-
-    groups
-        .into_par_iter()
-        .map(|(key, group)| {
-            // Convert owned Vecs to slices for rim_iterate
-            let col_refs: HashMap<String, &[i64]> = group
-                .column_data
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_slice()))
-                .collect();
-
-            let result = rim_iterate(&col_refs, &group.targets, opts)?;
-            Ok((key, result))
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
