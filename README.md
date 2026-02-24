@@ -1,5 +1,9 @@
 # rimpy
 
+<p align="center">
+  <img src="images/rimpy-banner-v5.svg" alt="rimpy banner" width="100%">
+</p>
+
 **Super fast rust-powered RIM (raking) survey weighting - supports both polars and pandas via Narwhals.**
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -315,20 +319,6 @@ schemes = rim.convert_from_weightipy(weightipy_targets)
 weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 ```
 
-## Performance
-
-rimpy uses a unified Arrow architecture: data flows from narwhals → Arrow PyCapsule → Rust → Arrow (with weight column appended) → narwhals, with zero Python objects in the hot path. Benchmark on synthetic survey data (polars backend):
-
-| Scenario | Time |
-|----------|------|
-| Small survey (n=1,000, 3 vars) | 0.17 ms |
-| Medium survey (n=10,000, 3 vars) | 0.67 ms |
-| Large survey (n=100,000, 3 vars) | 10.60 ms |
-| Very large survey (n=1,000,000, 3 vars) | 126.14 ms |
-| Grouped raking (n=100,000, 10 groups) | 14.34 ms |
-
-Grouped raking uses Rayon to parallelize across groups.
-
 ## Architecture
 
 rimpy uses a three-layer Rust design:
@@ -343,29 +333,30 @@ Python API  →  Narwhals (backend-agnostic DataFrames)
               Arrow Middleware (language-agnostic)
                   │
                   ▼
-              Raking Engine (pure Rust)
+              RIM Engine (pure Rust)
 ```
 
 The bottom two layers have zero Python dependencies — they can be reused by R, Julia, or any language with Arrow FFI support.
 
 ## How It Works
 
-rimpy implements iterative proportional fitting (IPF/raking):
-
-1. Your DataFrame (polars or pandas) is passed to Rust via Apache Arrow (zero-copy)
-2. Null rows are detected and excluded automatically
-3. Row indices are pre-computed for each target category
-4. The engine iteratively adjusts weights until they match your target proportions
-5. Weight caps are applied if specified
-6. A weight column is appended and the result is returned as your original DataFrame type
-
-Grouped raking (`rake_by`, `rake_by_scheme`) parallelizes across groups via Rayon.
-
-Data flow:
-
 ```
-df (polars/pandas) → narwhals → Arrow → Rust engine → Arrow → narwhals → df with weights
+df (polars/pandas) → narwhals → Arrow → RIM engine → Arrow → narwhals → df with weights
 ```
+
+## Performance
+
+Benchmark on synthetic survey data (polars backend), zero Python objects in the hot path:
+
+| Scenario | Time |
+|----------|------|
+| Small survey (n=1,000, 3 vars) | 0.17 ms |
+| Medium survey (n=10,000, 3 vars) | 0.67 ms |
+| Large survey (n=100,000, 3 vars) | 10.60 ms |
+| Very large survey (n=1,000,000, 3 vars) | 126.14 ms |
+| Grouped raking (n=100,000, 10 groups) | 14.34 ms |
+
+Grouped raking uses Rayon to parallelize across groups.
 
 ## License
 
