@@ -25,21 +25,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Create virtualenv and install dependencies
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Create venv and install dependencies
         run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install maturin pytest polars pandas pyarrow narwhals
+          uv venv
+          uv pip install maturin pytest polars pandas pyarrow narwhals
 
       - name: Build and install
-        run: |
-          source .venv/bin/activate
-          maturin develop --release
+        run: uv run maturin develop --release
 
       - name: Run tests
-        run: |
-          source .venv/bin/activate
-          pytest tests/ -v
+        run: uv run pytest tests/ -v
 
   # ---------------------------------------------------------------
   # Build wheels for each OS × Python version
