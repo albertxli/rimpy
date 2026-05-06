@@ -7,6 +7,7 @@ All data transfer uses Arrow PyCapsule — no Python lists in the data path.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,26 @@ def _normalize_targets(
             result.update(t)
         return result
     return targets
+
+
+def _detect_empty_target_categories(
+    df_nw: nw.DataFrame,
+    targets: dict[str, dict[Any, float]],
+) -> list[tuple[str, Any, float]]:
+    """Return [(column, code, target_value), ...] for non-zero targets with no data rows.
+
+    Type coercion: uses Python set membership, which treats numerically equal
+    int/float as equal (1 in {1.0} is True).
+    """
+    empty: list[tuple[str, Any, float]] = []
+    for col, props in targets.items():
+        if col not in df_nw.columns:
+            continue
+        unique_values = set(df_nw.get_column(col).unique().to_list())
+        for code, target_value in props.items():
+            if code not in unique_values and target_value != 0:
+                empty.append((col, code, target_value))
+    return empty
 
 
 def rake(
@@ -118,6 +139,13 @@ def rake(
     >>> # With controlled total
     >>> weighted = rimpy.rake(df, targets, total=1000)
     >>> weighted["weight"].sum()  # ≈ 1000
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every ``(column, code)`` pair where a non-zero
+    target proportion is supplied but the data has zero rows with that code
+    (after ``drop_nulls``). The rake still runs; the unsatisfiable target is
+    silently dropped by the engine.
     """
     result_df, _ = rake_with_diagnostics(
         df,
@@ -130,6 +158,7 @@ def rake(
         drop_nulls=drop_nulls,
         total=total,
         cap_correction=cap_correction,
+        _warning_stacklevel=3,
     )
     return result_df
 
@@ -146,6 +175,7 @@ def rake_with_diagnostics(
     drop_nulls: bool = True,
     total: float | None = None,
     cap_correction: bool = True,
+    _warning_stacklevel: int = 2,
 ) -> tuple[IntoFrameT, RakeResult]:
     """
     Apply RIM weights and return diagnostics.
@@ -156,6 +186,13 @@ def rake_with_diagnostics(
     -------
     tuple
         (weighted_dataframe, RakeResult)
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every ``(column, code)`` pair where a non-zero
+    target proportion is supplied but the data has zero rows with that code
+    (after ``drop_nulls``). The rake still runs; the unsatisfiable target is
+    silently dropped by the engine.
     """
     targets_dict = _normalize_targets(targets)
     target_columns = list(targets_dict.keys())
@@ -170,6 +207,21 @@ def rake_with_diagnostics(
     # Validate total
     if total is not None and total <= 0:
         raise ValueError(f"total must be positive, got {total}")
+
+    # Detect targets for codes that have zero rows in the data (after null-filtering
+    # to match the Rust engine's drop_nulls path) and warn the user — otherwise the
+    # engine silently drops these targets and produces weights that don't match the
+    # requested marginal distribution.
+    df_nw_for_check = (
+        df_nw.drop_nulls(subset=target_columns) if drop_nulls else df_nw
+    )
+    for col, code, val in _detect_empty_target_categories(df_nw_for_check, targets_dict):
+        warnings.warn(
+            f"Target code {code!r} for column '{col}' has zero rows in data; "
+            f"target ({val}) will be silently dropped from raking.",
+            UserWarning,
+            stacklevel=_warning_stacklevel,
+        )
 
     # Single Rust call: Arrow in → Arrow out (with weight column appended)
     result_arrow, diagnostics = rim_rake(
@@ -226,6 +278,15 @@ def rake_by(
     --------
     >>> targets = {"gender": {1: 50, 2: 50}, "age": {1: 30, 2: 40, 3: 30}}
     >>> weighted = rimpy.rake_by(df, targets, by="country")
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every group × ``(column, code)`` triple where a
+    non-zero target proportion is supplied but that group's data has zero rows
+    with that code (after ``drop_nulls``). The rake still runs; the unsatisfiable
+    target is silently dropped by the engine. Detection cost is
+    ``O(groups × target_columns)`` — for ``by`` columns producing >100 distinct
+    group keys, expect a few seconds of overhead on pandas backends.
     """
     result_df, _ = rake_by_with_diagnostics(
         df,
@@ -239,6 +300,7 @@ def rake_by(
         drop_nulls=drop_nulls,
         total=total,
         cap_correction=cap_correction,
+        _warning_stacklevel=3,
     )
     return result_df
 
@@ -256,6 +318,7 @@ def rake_by_with_diagnostics(
     drop_nulls: bool = True,
     total: float | None = None,
     cap_correction: bool = True,
+    _warning_stacklevel: int = 2,
 ) -> tuple[IntoFrameT, GroupedRakeResult]:
     """
     Apply RIM weights separately within groups and return diagnostics.
@@ -264,16 +327,52 @@ def rake_by_with_diagnostics(
     -------
     tuple
         (weighted_dataframe, GroupedRakeResult)
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every group × ``(column, code)`` triple where a
+    non-zero target proportion is supplied but that group's data has zero rows
+    with that code (after ``drop_nulls``). Detection cost is
+    ``O(groups × target_columns)``.
     """
     if isinstance(by, str):
         by = [by]
 
     df_nw = nw.from_native(df, eager_only=True)
     targets_dict = _normalize_targets(targets)
+    target_col_names = list(targets_dict.keys())
 
     # Validate total
     if total is not None and total <= 0:
         raise ValueError(f"total must be positive, got {total}")
+
+    # Per-group empty-target detection. A code may exist globally but be absent
+    # from a specific group's slice — only per-group filtering catches that.
+    group_combos = df_nw.unique(subset=by, maintain_order=True).select(by)
+    for combo in group_combos.iter_rows(named=True):
+        filter_expr = None
+        for c in by:
+            v = combo[c]
+            cond = nw.col(c).is_null() if v is None else (nw.col(c) == v)
+            filter_expr = cond if filter_expr is None else filter_expr & cond
+
+        group_df = df_nw.filter(filter_expr)
+        if drop_nulls:
+            group_df = group_df.drop_nulls(subset=target_col_names)
+
+        if len(by) == 1:
+            group_label_str = repr(combo[by[0]])
+        else:
+            group_label_str = ", ".join(f"{c}={combo[c]!r}" for c in by)
+
+        for col, code, val in _detect_empty_target_categories(group_df, targets_dict):
+            warnings.warn(
+                f"Group ({group_label_str}): target code {code!r} for column "
+                f"'{col}' has zero rows in this group; target ({val}) will be "
+                f"silently dropped.",
+                UserWarning,
+                stacklevel=_warning_stacklevel,
+            )
 
     # Single Rust call: full DataFrame + group columns → Arrow with weights
     result_arrow, group_diags_dict = rim_rake_grouped(
@@ -377,6 +476,14 @@ def rake_by_scheme(
     ...     "UK": {"gender": {1: 49, 2: 51}, "age": {1: 18, 2: 32, 3: 28, 4: 22}},
     ... }
     >>> weighted = rimpy.rake_by_scheme(df, country_targets, by="country")
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every scheme group × ``(column, code)`` triple
+    where a non-zero target proportion is supplied but that group's data has
+    zero rows with that code (after ``drop_nulls``). Groups falling back to
+    ``default_scheme`` are also checked. Detection cost is
+    ``O(groups × target_columns)``.
     """
     result_df, _ = rake_by_scheme_with_diagnostics(
         df,
@@ -392,6 +499,7 @@ def rake_by_scheme(
         group_totals=group_totals,
         total=total,
         cap_correction=cap_correction,
+        _warning_stacklevel=3,
     )
     return result_df
 
@@ -411,6 +519,7 @@ def rake_by_scheme_with_diagnostics(
     group_totals: dict[Any, float] | None = None,
     total: float | None = None,
     cap_correction: bool = True,
+    _warning_stacklevel: int = 2,
 ) -> tuple[IntoFrameT, GroupedRakeResult]:
     """
     Apply different weighting schemes to different groups with diagnostics.
@@ -419,6 +528,13 @@ def rake_by_scheme_with_diagnostics(
     -------
     tuple
         (weighted_dataframe, GroupedRakeResult)
+
+    Warnings
+    --------
+    Emits ``UserWarning`` for every scheme group × ``(column, code)`` triple
+    where a non-zero target proportion is supplied but that group's data has
+    zero rows with that code (after ``drop_nulls``). Groups falling back to
+    ``default_scheme`` are also checked.
     """
     df_nw = nw.from_native(df, eager_only=True)
 
@@ -438,6 +554,41 @@ def rake_by_scheme_with_diagnostics(
     normalized_default = None
     if default_scheme is not None:
         normalized_default = _normalize_targets(default_scheme)
+
+    # Per-group empty-target detection. Covers both groups with explicit schemes
+    # and groups falling back to default_scheme.
+    unique_groups = set(df_nw.get_column(by).unique().to_list())
+    explicit_groups = set(normalized_schemes.keys()) & unique_groups
+    fallback_groups = (
+        (unique_groups - set(normalized_schemes.keys()))
+        if normalized_default is not None
+        else set()
+    )
+
+    def _check_scheme_group(
+        group_key: Any,
+        scheme_dict: dict[str, dict[Any, float]],
+        scheme_label: str,
+    ) -> None:
+        if group_key is None:
+            group_df = df_nw.filter(nw.col(by).is_null())
+        else:
+            group_df = df_nw.filter(nw.col(by) == group_key)
+        if drop_nulls:
+            group_df = group_df.drop_nulls(subset=list(scheme_dict.keys()))
+        for col, code, val in _detect_empty_target_categories(group_df, scheme_dict):
+            warnings.warn(
+                f"{scheme_label} group ({group_key!r}): target code {code!r} for "
+                f"column '{col}' has zero rows in this group; target ({val}) "
+                f"will be silently dropped.",
+                UserWarning,
+                stacklevel=_warning_stacklevel,
+            )
+
+    for group_key in explicit_groups:
+        _check_scheme_group(group_key, normalized_schemes[group_key], "Scheme")
+    for group_key in fallback_groups:
+        _check_scheme_group(group_key, normalized_default, "Default-scheme")
 
     # Single Rust call: full DataFrame → Arrow with weights
     result_arrow, group_diags_dict = rim_rake_by_scheme(

@@ -41,3 +41,9 @@ Structure.md
 RELEASE_GUIDE.md
 CLAUDE.md
 arch_comparison.md
+
+# Q-Testing
+testing_with_q/
+
+# Marimo notebook scratch
+notebook_test/
