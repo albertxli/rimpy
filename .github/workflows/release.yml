@@ -10,10 +10,56 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------
+  # Pre-release verification: catch common mistakes before building.
+  #   - pyproject.toml and Cargo.toml versions must match.
+  #   - Tag version (if triggered by tag push) must match pyproject.toml.
+  #   - Print the final runtime dependency list so the action log shows
+  #     exactly what's about to ship (visibility against accidental
+  #     dev-side dependency leaks).
+  # ---------------------------------------------------------------
+  verify:
+    name: Verify release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version alignment
+        run: |
+          PY_VERSION=$(grep -E '^version = ' pyproject.toml | head -1 | sed -E 's/version = "(.+)"/\1/')
+          RS_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.+)"/\1/')
+          echo "pyproject.toml version: $PY_VERSION"
+          echo "Cargo.toml version:     $RS_VERSION"
+          if [ "$PY_VERSION" != "$RS_VERSION" ]; then
+            echo "::error::Version mismatch: pyproject.toml=$PY_VERSION, Cargo.toml=$RS_VERSION"
+            exit 1
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "Git tag version:        $TAG_VERSION"
+            if [ "$PY_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $PY_VERSION"
+              exit 1
+            fi
+          fi
+
+      - name: Show runtime dependencies (visibility check)
+        run: |
+          echo "=== Runtime dependencies that will ship to PyPI ==="
+          python3 -c "
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          deps = data.get('project', {}).get('dependencies', [])
+          for d in deps:
+              print(f'  - {d}')
+          print(f'Total: {len(deps)} runtime deps')
+          "
+
+  # ---------------------------------------------------------------
   # Build wheels for each OS × Python version
   # ---------------------------------------------------------------
   build:
     name: Build / ${{ matrix.os }} / ${{ matrix.python }}
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +85,7 @@ jobs:
   # ---------------------------------------------------------------
   sdist:
     name: Build sdist
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
