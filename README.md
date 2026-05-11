@@ -361,6 +361,23 @@ schemes = rim.convert_from_weightipy(weightipy_targets)
 weighted = rim.rake_by_scheme(df, schemes, by="country_code")
 ```
 
+## Special edge cases
+
+RIM weighting has a handful of edge cases where rimpy's behavior is non-obvious
+or diverges from professional weighting tools like Q, SPSS, and weightipy.
+Notable examples include:
+
+- **`target = 0` on a category that has respondents** — the literal interpretation
+  ("weighted % must be 0") is ambiguous in the algorithm and tools disagree on
+  how to handle it. rimpy's default refuses with an actionable error; opt-in
+  modes (`hard_zero`, `near_zero`) cover the Q / SPSS / weightipy conventions.
+- **Empty target categories** — when a non-zero target is supplied for a
+  category code that doesn't exist in the data. rimpy emits a `UserWarning`.
+
+See **[`edge_cases.md`](edge_cases.md)** for the full treatment of each case,
+the empirical comparison against Q's R-engine output, and recommendations on
+which mode to use in production parallel-validation workflows.
+
 ## License
 
 MIT
