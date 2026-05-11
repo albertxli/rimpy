@@ -129,3 +129,147 @@ Cross-check against R `survey::rake()` and weightipy to confirm whether they err
 
 ### Reference
 Q's writeup: <https://help.qresearchsoftware.com/hc/en-us/articles/4414958629391-Common-Errors-in-Weights> — section "Empty Categories".
+
+---
+
+## 3. Decide & document semantics for `target = 0` on non-empty categories
+
+### Problem
+When a user supplies `target = 0` for a category that **does** contain respondents, rimpy's output silently disagrees with the user's literal spec and with every other professional weighting tool except weightipy.
+
+Concrete example reported by a user:
+
+```python
+targets = {
+    "gender":        {1: 50, 2: 50},
+    "education":  {1: 33, 2: 24, 3: 33, 4: 0, 5: 10},
+}
+```
+
+`education = 4` contains 2 respondents and is given a target of 0.
+
+- **rimpy output:** the 2 respondents land at weight ≈ 0.45 each; weighted % for category 4 is ~0.28%, not 0%. The target the user wrote is not satisfied.
+- **Q / SPSS / svyweight output:** weight = 0 for those respondents; weighted % = 0.000000%; the target is satisfied. Effective n drops 320 → 318.
+
+The divergence is silent — no warning, no doc note. A user QC'ing rimpy against Q on the same fixture sees different weights and gets no signal why.
+
+### Current behavior in rimpy
+The decisive guard is `src/engine.rs:98-99` inside `rake_on_variable`:
+
+```rust
+let target_count = target_prop * n;
+if target_count < 1e-10 {
+    continue;          // ← target=0 → skip this category entirely
+}
+```
+
+When `target_prop = 0`, the category is silently **skipped** — no multiplier is applied. Respondents in that category keep whatever weight the *other* dimensions assigned them. A secondary code path at `src/engine.rs:339` replaces any exact `0.0` weight with `1.0` post-iteration, so even if the algorithm naturally produced zeros they would be flipped back to non-zero.
+
+The recently-added detection helper at `python/rimpy/_rake.py:61-78` (`_detect_empty_target_categories`, item #2) only fires when `code not in unique_values and target_value != 0`. The asymmetric `!= 0` filter was correct for #2 (we only wanted to surface non-zero targets that couldn't be satisfied by empty cells). But it leaves this case — populated cell + zero target — completely unsurfaced. `validate_targets` at `_rake.py:720` and `validate_schemes` at `_rake.py:804` have the same filter.
+
+### What other tools do
+
+| Library | Zero-target on non-empty cell | Warning / error | Source |
+|---|---|---|---|
+| Q, Quantum, SPSS RIM | Hard zero (weight=0, weighted %=0) | Documented behavior | Q "Common Errors in Weights" article |
+| R `svyweight::rakesvy` | Hard zero (explicit "assigns weight = 0") | Documented behavior | rdrr.io/cran/svyweight/man/rakesvy |
+| R `anesrake` v0.80 | **Refuses to run**: `stop("you cannot rake any variable category to 0 or a negative number")` | Hard error before iteration | `R/rakeonvar.numeric.R:19`, `R/rakeonvar.factor.R:18`, `R/rakeonvar.default.R:20` |
+| R `survey::rake` | Undefined — docs limit convergence guarantee to tables with no zero cells | Silent | <https://r-survey.r-forge.r-project.org/survey/html/rake.html> |
+| `weightipy` | Substitutes `0 → 0.00000001` | Silent | `weightipy/internal/rim.py` `rakeonvar()` |
+| **rimpy** | Silent skip via `engine.rs:99` | Silent | this codebase |
+
+Three coherent camps emerge: **hard zero** (Q / SPSS / svyweight), **refuse** (anesrake), and **near-zero silent skip** (weightipy and rimpy — different mechanisms, similar behavior). No industry consensus.
+
+### What's missing
+1. **No decision** on which camp rimpy belongs to. The current behavior is the result of a divide-by-zero guard rather than a deliberate contract.
+2. **No detection** for the populated-cell + zero-target case. The existing helper's `!= 0` filter actively excludes it.
+3. **No warning** when output diverges from the user's literal spec.
+4. **No documentation** of the in-house Povaddo workaround (supplying `0.001%` to "show as ~0% without losing respondents" — a workflow convention, not a library contract).
+
+### Design options
+- **(a) Hard zero — match Q / SPSS / svyweight.** Drive the weights to 0 in the algorithm. Drop the `target_count < 1e-10` early-continue and the `engine.rs:339` zero-to-one flip for legitimately-zeroed categories. Emit `UserWarning` so existing pipelines don't silently change. **Recommended (user's lean).** Matches the most widely-used professional tools and respects the literal targets dict.
+- **(b) Keep current silent-skip but document loudly.** Re-frame as "exclude this dimension's marginal constraint for this category while retaining respondents' cross-dimensional weight." Add `UserWarning` describing divergence from Q. Defensible if documented but harder to communicate to survey researchers familiar with Q.
+- **(c) Refuse — match anesrake.** Raise `ValueError` on any zero target with non-empty cells. Forces explicit intent (drop respondents upstream, or supply a near-zero positive target). Most disruptive to existing rimpy users.
+
+### Proposed fix (sketch)
+**Recommendation: option (a) — hard zero with warning.**
+
+- Remove `if target_count < 1e-10 { continue; }` at `engine.rs:99`; let the multiplicative update apply (multiplier becomes 0, weights for that category become 0).
+- Revisit `engine.rs:339` post-iteration `0.0 → 1.0` flip. This was a numerical safety net; it must not undo legitimate zero weights. Likely: track which categories had `target_prop == 0` explicitly and skip the flip for their rows.
+- Add Python-side `_detect_zero_target_on_populated_cell()` helper paralleling `_detect_empty_target_categories`, wired into all 6 entry points the same way (private `_warning_stacklevel` kwarg). Emit `UserWarning` whenever the user supplies `target = 0` for a populated cell, regardless of whether the chosen contract is (a), (b), or (c) — the user should always know they're hitting an edge case.
+- Cross-check the resulting weights and weighted marginals against R `svyweight::rakesvy` on the user's fixture before merging.
+
+### Povaddo near-zero convention
+The in-house RPM workflow of supplying `0.001%` for "show as ~0% without losing respondents" is a **workflow convention external to rimpy**, not a library contract. Document this explicitly. Open question: codify a constant like `rimpy.NEAR_ZERO = 1e-8` for users who want a sanctioned shortcut, or leave it as user responsibility?
+
+### Validation requirements (per CLAUDE.md)
+Any algorithm change here must be cross-checked against R `survey::rake()`, weightipy, and ideally one anesrake run on the same fixture (anesrake will error out — confirm that's the case). Lock the contract before shipping. The user's 320-row education fixture is a good acceptance test.
+
+### Reference
+- Q "Common Errors in Weights": <https://help.qresearchsoftware.com/hc/en-us/articles/4414958629391-Common-Errors-in-Weights>
+- anesrake v0.80 source at `C:\Users\lipov\SynologyDrive\sandbox\anesrake_0.80\anesrake\R\` (rakeonvar.{numeric,factor,default}.R)
+- weightipy source: <https://github.com/kaitumisuuringute-keskus/Weightipy/blob/main/weightipy/internal/rim.py>
+- R `survey::rake` docs: <https://r-survey.r-forge.r-project.org/survey/html/rake.html>
+- R `svyweight::rakesvy` docs: <https://rdrr.io/cran/svyweight/man/rakesvy.html>
+
+### Out of scope for this item
+- Item #1 (contradictory targets / stall vs. converged).
+- Item #4 (target-dict key validation / tuple syntax).
+
+---
+
+## 4. Validate target-dict keys + accept tuple keys for combined-category targets
+
+### Problem
+Two related target-dict footguns currently produce silently-wrong weights:
+
+**A. Arithmetic-evaluated keys (Python literal trap).** A user writing
+```python
+"education": {1: 33, 2: 20, 3: 33, 4-5: 14}
+```
+intends to give categories 4 and 5 a shared target of 14. But Python evaluates `4-5` at dict-construction time, so the dict that reaches rimpy is `{1: 33, 2: 20, 3: 33, -1: 14}`. rimpy silently accepts the `-1` key, fails to map it to any real category, and produces wrong weights.
+
+**B. No first-class combined-category syntax.** Combining sparse categories before weighting is a routine survey operation. Users currently have to merge the underlying data column upstream, since rimpy's target dict has no `(4, 5): 14` form. This pushes data-prep into every notebook and makes the fix for problem A (use tuple syntax) ironic — the suggestion only works if tuple syntax is actually supported.
+
+### Current behavior in rimpy
+
+**Unknown keys (A):**
+- `validate_targets` at `python/rimpy/_rake.py:720` and `validate_schemes` at `_rake.py:804` warn about unknown keys, but only when `target_value != 0`. So `{-1: 0}` passes silently, and even `{-1: 14}` only emits a warning if the user explicitly calls `validate_targets()` — the regular `rake()` path never invokes this check.
+- The FFI layer at `src/lib.rs:184-204` (`extract_targets`) happily accepts the `-1` key as a valid `i64`; nothing downstream rejects it.
+
+**Tuple keys (B):**
+- `src/lib.rs:184-204` (`extract_targets`) only accepts `i64` or `f64` keys (line 193: `code_key.extract::<i64>().or_else(|_| code_key.extract::<f64>().map(|f| f as i64))?`). A tuple key fails extraction with an opaque PyO3 error.
+- No Python-side normalization expands tuple keys before the FFI call.
+
+### What's missing
+1. **Unknown-key validation fired automatically inside `rake()` and `rake_by()` paths**, not gated on `target_value != 0` and not requiring the user to opt in by calling `validate_targets`.
+2. **An actionable error message** that points the user toward the tuple-key fix when an arithmetic-evaluated key looks like a typo (e.g., a non-positive key like `-1` when the column has only positive codes).
+3. **First-class tuple-key support** in the rake API.
+
+### Proposed fix (sketch)
+
+**Sub-problem A — unknown-key validation:**
+- Add validation that runs from inside the rake pipeline (alongside the existing `_detect_empty_target_categories` invocations in `rake_with_diagnostics`, `rake_by_with_diagnostics`, `rake_by_scheme_with_diagnostics`).
+- Validate every target key against the column's unique values **regardless of target value**.
+- Decision: warn or raise? Lean: **raise** (`KeyError` or `ValueError`). Unknown keys are unambiguously a bug in the caller's targets dict; they're not a development-time partial-data scenario like #2.
+- Error message format: `"Key -1 not found in categories [1, 2, 3, 4, 5] for column 'education'. If you meant to combine categories 4 and 5, use tuple syntax: (4, 5): 14."`
+
+**Sub-problem B — tuple-key combined-category syntax:**
+- Accept `{(4, 5): 14}` as "categories 4 and 5 share a combined weighted target of 14".
+- **Python-side normalization preferred** — keeps the Rust engine pure and avoids changing the FFI contract. Two implementation paths to choose between:
+  - **Split**: expand `{(4, 5): 14}` to `{4: 14, 5: 14}` with shared-target bookkeeping (each respondent in 4 or 5 contributes to the combined marginal of 14).
+  - **Virtual code**: synthesize a new internal code (e.g., the smallest unused integer) and remap the data column to it for raking, then map back for the output.
+  - Decision deferred until this item is implemented; both are reasonable.
+- Open question: how does this interact with `_detect_empty_target_categories` (a tuple is "empty" only if *all* its codes have zero rows) and with the zero-target contract decided in item #3?
+
+### Validation requirements (per CLAUDE.md)
+- Cross-check the tuple syntax against weightipy and other RIM libraries — survey research has standard combined-category semantics we shouldn't reinvent. If a popular library uses `{4: 14, 5: 14}` to mean "separately, each at 14%" then `(4, 5): 14` to mean "combined at 14%" is the natural delta.
+- Test fixtures must cover: (i) `-1` from `4-5` typo with non-zero target, (ii) `-1` with zero target (catches the existing `!= 0` filter bug), (iii) tuple-key happy path, (iv) tuple-key where one element is missing from the data (interaction with item #2).
+
+### Reference
+- Item #2 `_detect_empty_target_categories` at `python/rimpy/_rake.py:61-78` — model for the new validation helper.
+- `extract_targets` at `src/lib.rs:184-204` — FFI extraction logic to update if going the FFI route (not recommended).
+
+### Out of scope for this item
+- Item #3 (zero-target semantics decision) — different contract decision.
+- Item #1 (contradictory targets).
