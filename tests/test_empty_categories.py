@@ -1,10 +1,14 @@
 """
 Tests for empty-target-category detection in the rimpy API.
 
-When a user supplies a non-zero target proportion for a category code that has
-zero rows in the data (or zero rows within a specific group's slice), the rake
-engine silently drops that target. These tests assert that rimpy emits a
-``UserWarning`` for every such case across all 6 entry points (rake,
+Contract (since item #4):
+- A target code absent from the ENTIRE raw column raises ``ValueError``
+  (unknown key — almost certainly a typo in the targets dict).
+- A code present in the column but with zero rows within a group's slice
+  (or after null-dropping) emits a ``UserWarning`` — that is normal partial
+  data, and the engine silently drops the unsatisfiable target.
+
+These tests cover both severities across all 6 entry points (rake,
 rake_with_diagnostics, rake_by, rake_by_with_diagnostics, rake_by_scheme,
 rake_by_scheme_with_diagnostics).
 
@@ -76,11 +80,17 @@ def survey_df_with_gaps(
 
 @pytest.fixture
 def survey_df_with_null_country_polars(survey_df_with_gaps_polars):
-    """Variant where ~10 rows have country=None and a missing age_group code."""
+    """Variant where the first 10 rows have country=None and are guaranteed to
+    lack age_group=4 (present globally via US rows) — so the None group gets a
+    per-group empty-category warning without any globally-unknown key."""
     df = survey_df_with_gaps_polars
     null_mask = pl.Series([True] * 10 + [False] * (len(df) - 10))
     return df.with_columns(
-        pl.when(null_mask).then(None).otherwise(pl.col("country")).alias("country")
+        pl.when(null_mask).then(None).otherwise(pl.col("country")).alias("country"),
+        pl.when(null_mask & (pl.col("age_group") == 4))
+        .then(1)
+        .otherwise(pl.col("age_group"))
+        .alias("age_group"),
     )
 
 
@@ -100,28 +110,21 @@ def _empty_cat_warnings(captured):
 
 
 class TestRakeEmptyCategories:
-    def test_warns_on_missing_global_code(self, survey_df_with_gaps):
-        """gender=3 has zero rows; target for it should fire a warning."""
+    def test_raises_on_missing_global_code(self, survey_df_with_gaps):
+        """gender=3 has zero rows in the entire column → unknown-key ValueError."""
         targets = {"gender": {1: 40.0, 2: 40.0, 3: 20.0}}
-        with pytest.warns(
-            UserWarning, match=r"Target code 3 for column 'gender'"
-        ):
-            result = rimpy.rake(survey_df_with_gaps, targets)
-        # Rake still runs and produces output
-        assert "weight" in result.columns
-        assert len(result) == len(survey_df_with_gaps)
+        with pytest.raises(
+            ValueError, match=r"Unknown target key\(s\) not present in the data"
+        ) as excinfo:
+            rimpy.rake(survey_df_with_gaps, targets)
+        assert "column 'gender': key 3" in str(excinfo.value)
+        assert "[1, 2]" in str(excinfo.value)
 
-    def test_warns_via_with_diagnostics_variant(self, survey_df_with_gaps):
-        """Warning fires when calling rake_with_diagnostics() directly."""
+    def test_raises_via_with_diagnostics_variant(self, survey_df_with_gaps):
+        """The error fires when calling rake_with_diagnostics() directly too."""
         targets = {"gender": {1: 40.0, 2: 40.0, 3: 20.0}}
-        with pytest.warns(
-            UserWarning, match=r"Target code 3 for column 'gender'"
-        ):
-            result, diag = rimpy.rake_with_diagnostics(
-                survey_df_with_gaps, targets
-            )
-        assert "weight" in result.columns
-        assert diag.converged
+        with pytest.raises(ValueError, match=r"Unknown target key"):
+            rimpy.rake_with_diagnostics(survey_df_with_gaps, targets)
 
     def test_no_warning_on_complete_data(self, survey_df_with_gaps):
         """All target codes present in data → no empty-category warning."""
@@ -140,11 +143,24 @@ class TestRakeEmptyCategories:
     ):
         """Warning's filename should match this test file, not _rake.py.
         Verifies stacklevel through both the public and _with_diagnostics paths.
+
+        Uses the null-drop path: region=4 exists in the raw column but all its
+        rows have gender nulled out, so after drop_nulls the cell is empty —
+        the surviving warning case for the single-group path.
         """
-        targets = {"gender": {1: 40.0, 2: 40.0, 3: 20.0}}
+        df = survey_df_with_gaps_polars.with_columns(
+            pl.when(pl.col("region") == 4)
+            .then(None)
+            .otherwise(pl.col("gender"))
+            .alias("gender")
+        )
+        targets = {
+            "gender": {1: 50.0, 2: 50.0},
+            "region": {1: 30.0, 2: 30.0, 3: 30.0, 4: 10.0},
+        }
         with warnings.catch_warnings(record=True) as recs:
             warnings.simplefilter("always")
-            fn(survey_df_with_gaps_polars, targets)
+            fn(df, targets)
         empty_warns = _empty_cat_warnings(recs)
         assert len(empty_warns) == 1
         # __file__ for this test module
@@ -153,18 +169,17 @@ class TestRakeEmptyCategories:
             f"got {empty_warns[0].filename}"
         )
 
-    def test_no_double_warning(self, survey_df_with_gaps_polars):
-        """One missing code → exactly one warning, not two."""
+    def test_no_double_listing_in_error(self, survey_df_with_gaps_polars):
+        """One missing code → listed exactly once in the aggregated error."""
         targets = {"gender": {1: 40.0, 2: 40.0, 3: 20.0}}
-        with warnings.catch_warnings(record=True) as recs:
-            warnings.simplefilter("always")
+        with pytest.raises(ValueError) as excinfo:
             rimpy.rake(survey_df_with_gaps_polars, targets)
-        assert len(_empty_cat_warnings(recs)) == 1
+        assert str(excinfo.value).count("key 3") == 1
 
     def test_int_target_key_with_float_dataframe_column(
         self, survey_df_with_gaps_polars
     ):
-        """Float64 data column + int-keyed targets should not spuriously warn
+        """Float64 data column + int-keyed targets should not spuriously raise
         for codes that exist (1 ↔ 1.0 numeric equality)."""
         df = survey_df_with_gaps_polars.with_columns(
             pl.col("gender").cast(pl.Float64)
@@ -175,48 +190,37 @@ class TestRakeEmptyCategories:
             rimpy.rake(df, {"gender": {1: 50.0, 2: 50.0}})
         assert len(_empty_cat_warnings(recs)) == 0
 
-        # Add a genuinely missing code → exactly one warning
-        with warnings.catch_warnings(record=True) as recs:
-            warnings.simplefilter("always")
+        # Add a genuinely missing code → unknown-key error
+        with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(df, {"gender": {1: 40.0, 2: 40.0, 3: 20.0}})
-        assert len(_empty_cat_warnings(recs)) == 1
 
     def test_float_target_key_with_int_dataframe_column(
         self, survey_df_with_gaps_polars
     ):
         """Reverse: Int64 data column + float-keyed targets. Set membership
-        relies on hash(1) == hash(1.0); should not asymmetrically warn."""
+        relies on hash(1) == hash(1.0); should not asymmetrically raise."""
         df = survey_df_with_gaps_polars  # gender is Int64
         with warnings.catch_warnings(record=True) as recs:
             warnings.simplefilter("always")
             rimpy.rake(df, {"gender": {1.0: 50.0, 2.0: 50.0}})
         assert len(_empty_cat_warnings(recs)) == 0
 
-        # Zero target for missing code → still suppressed
-        with warnings.catch_warnings(record=True) as recs:
-            warnings.simplefilter("always")
-            rimpy.rake(
-                df, {"gender": {1.0: 50.0, 2.0: 50.0, 3.0: 0.0}}
-            )
-        assert len(_empty_cat_warnings(recs)) == 0
+        # Missing code raises regardless of target value — the != 0 loophole
+        # that let {3.0: 0.0} through silently is closed.
+        with pytest.raises(ValueError, match=r"Unknown target key"):
+            rimpy.rake(df, {"gender": {1.0: 50.0, 2.0: 50.0, 3.0: 0.0}})
 
-        # Non-zero target for missing code → exactly one warning
-        with warnings.catch_warnings(record=True) as recs:
-            warnings.simplefilter("always")
-            rimpy.rake(
-                df, {"gender": {1.0: 40.0, 2.0: 40.0, 3.0: 20.0}}
-            )
-        assert len(_empty_cat_warnings(recs)) == 1
+        with pytest.raises(ValueError, match=r"Unknown target key"):
+            rimpy.rake(df, {"gender": {1.0: 40.0, 2.0: 40.0, 3.0: 20.0}})
 
-    def test_zero_target_for_missing_code_silent(
+    def test_zero_target_for_missing_code_raises(
         self, survey_df_with_gaps_polars
     ):
-        """target_value == 0 for a missing code is intentional and must not warn."""
+        """target_value == 0 for a globally missing code raises like any other
+        unknown key — an absent code is a dict bug regardless of its value."""
         targets = {"gender": {1: 50.0, 2: 50.0, 3: 0.0}}
-        with warnings.catch_warnings(record=True) as recs:
-            warnings.simplefilter("always")
+        with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(survey_df_with_gaps_polars, targets)
-        assert len(_empty_cat_warnings(recs)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -281,11 +285,13 @@ class TestRakeByEmptyCategories:
         self, survey_df_with_null_country_polars
     ):
         """Rows with country=None form their own group; warnings should
-        render cleanly as Group (None): ... and not raise TypeError."""
+        render cleanly as Group (None): ... and not raise TypeError.
+
+        age_group=4 exists globally (US rows) but the fixture guarantees the
+        null-country rows lack it — a per-group warning, not an unknown key.
+        """
         df = survey_df_with_null_country_polars
-        # Confirm the null-country rows have age_group ∈ {1,2,3,4} but we'll
-        # request a code that doesn't exist there
-        targets = {"age_group": {1: 20.0, 2: 20.0, 3: 20.0, 4: 20.0, 99: 20.0}}
+        targets = {"age_group": {1: 25.0, 2: 25.0, 3: 25.0, 4: 25.0}}
         with warnings.catch_warnings(record=True) as recs:
             warnings.simplefilter("always")
             rimpy.rake_by(df, targets, by="country")

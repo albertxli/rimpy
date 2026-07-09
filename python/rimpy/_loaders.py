@@ -32,6 +32,9 @@ def load_schemes(
 
     Converts a table of targets into nested dict format for rake_by_scheme().
 
+    Combined-category (tuple-key) targets are dict-API-only for now — scheme
+    files hold one scalar code per row (see to_be_added.md item #5).
+
     Parameters
     ----------
     source
@@ -164,6 +167,9 @@ def load_schemes_wide(
 
     Converts a table where scheme keys are columns into nested dict format
     for rake_by_scheme().
+
+    Combined-category (tuple-key) targets are dict-API-only for now — scheme
+    files hold one scalar code per row (see to_be_added.md item #5).
 
     Parameters
     ----------

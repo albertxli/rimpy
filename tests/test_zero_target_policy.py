@@ -149,16 +149,17 @@ class TestZeroTargetPolicyDefault:
         result = rimpy.rake(fixture_320_partyaffiliation_polars, targets)
         assert "weight" in result.columns
 
-    def test_zero_target_on_empty_cell_no_error(
+    def test_zero_target_on_unknown_code_raises_unknown_key(
         self, fixture_320_partyaffiliation_polars
     ):
-        # education code 99 doesn't exist in the data; target=0 for it is a no-op.
+        # education code 99 doesn't exist in the data. Since item #4, unknown
+        # keys raise regardless of target value — before zero_target_policy runs.
         targets = {
             "gender": {1: 50.0, 2: 50.0},
             "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 1.0, 5: 9.0, 99: 0.0},
         }
-        result = rimpy.rake(fixture_320_partyaffiliation_polars, targets)
-        assert "weight" in result.columns
+        with pytest.raises(ValueError, match=r"Unknown target key"):
+            rimpy.rake(fixture_320_partyaffiliation_polars, targets)
 
 
 # ---------------------------------------------------------------------------
@@ -498,10 +499,11 @@ class TestZeroTargetPolicyValidation:
 
 
 class TestZeroTargetPolicyDoesNotBreakItem2:
-    def test_item_2_warning_still_fires_when_no_zero_targets(
+    def test_unknown_key_raises_even_with_nonzero_target(
         self, fixture_320_partyaffiliation_polars
     ):
-        # Item #2 case: non-zero target on an EMPTY cell (code 99 absent from data)
+        # Code 99 absent from the data with a non-zero target. Pre-item-#4 this
+        # was the item #2 warning; a globally-unknown key is now a hard error.
         targets = {
             "gender": {1: 50.0, 2: 50.0},
             "education": {
@@ -513,15 +515,14 @@ class TestZeroTargetPolicyDoesNotBreakItem2:
                 99: 10.0,
             },
         }
-        with pytest.warns(
-            UserWarning, match=r"Target code 99 for column 'education'"
-        ):
+        with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(fixture_320_partyaffiliation_polars, targets)
 
-    def test_item_2_and_item_3_coexist_under_hard_zero(
+    def test_item_3_hard_zero_still_works_without_unknown_keys(
         self, fixture_320_partyaffiliation_polars
     ):
-        # Both cases present: code 99 absent (item #2 warns), code 4 has zero target (item #3 acts)
+        # Zero target on a populated cell (item #3) with all keys valid:
+        # hard_zero handles it, no warning, no exception.
         targets = {
             "gender": {1: 50.0, 2: 50.0},
             "education": {
@@ -530,7 +531,6 @@ class TestZeroTargetPolicyDoesNotBreakItem2:
                 3: 33.0,
                 4: 0.0,
                 5: 10.0,
-                99: 0.0,  # absent code with zero target — no-op for both items
             },
         }
         with warnings.catch_warnings(record=True) as recs:
@@ -540,9 +540,22 @@ class TestZeroTargetPolicyDoesNotBreakItem2:
                 targets,
                 zero_target_policy="hard_zero",
             )
-        # No item #2 warning fires (code 99 has target 0 → suppressed)
-        # No exception (item #3 hard_zero handles it)
-        # education=4 weight should be 0
         assert (
             result.filter(pl.col("education") == 4)["weight"].sum() == 0.0
         )
+
+    def test_unknown_key_raises_before_hard_zero_policy(
+        self, fixture_320_partyaffiliation_polars
+    ):
+        # Ordering proof: an unknown key raises even under hard_zero — key
+        # validation runs before zero_target_policy ever sees the targets.
+        targets = {
+            "gender": {1: 50.0, 2: 50.0},
+            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 0.0, 5: 10.0, 99: 0.0},
+        }
+        with pytest.raises(ValueError, match=r"Unknown target key"):
+            rimpy.rake(
+                fixture_320_partyaffiliation_polars,
+                targets,
+                zero_target_policy="hard_zero",
+            )

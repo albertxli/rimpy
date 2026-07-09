@@ -245,50 +245,145 @@ zero-target policy fix solves what it was designed to solve.
 
 ### The problem
 
-You supply a target proportion for a category code that has **zero
-respondents** in the data:
+You supply a target proportion for a category code that has zero respondents
+in the frame being raked — the engine can't satisfy this target; there's no
+one to weight.
+
+### Behavior (since item #4 tightened the contract)
+
+Two severities depending on *where* the code is missing:
+
+- **Absent from the entire raw column** → `ValueError` before raking (see
+  §3 — an unknown key is a targets-dict bug, not a data condition).
+- **Present in the column but zero rows in the relevant slice** — i.e. within
+  one group of `rake_by`/`rake_by_scheme`, or globally but only after
+  `drop_nulls` removed its rows — → `UserWarning`, and the rake still runs
+  with the unsatisfiable target silently dropped by the engine:
+
+```
+UserWarning: Group ('UK'): target code 4 for column 'age' has zero rows
+             in this group; target (25.0) will be silently dropped.
+```
+
+Group labels are deterministic:
+
+- `rake_by`: `Group ('UK'): ...`
+- `rake_by`, multi-column `by`: `Group (country='US', gender=2): ...`
+- `rake_by_scheme`, explicit scheme: `Scheme group ('UK'): ...`
+- `rake_by_scheme`, default-scheme fallback: `Default-scheme group ('CA'): ...`
+
+This split matches real workflows: a shared code frame where one group lacks
+a category (no age=4 respondents in UK this wave) is normal partial data and
+shouldn't block the run; a code that exists nowhere in the column is almost
+certainly a typo and should.
+
+### Handling a category that came back empty this wave
+
+Remove its key from that wave's targets dict (or combine it into a
+neighboring category with tuple syntax, §4):
 
 ```python
-targets = {"gender": {1: 50, 2: 45, 3: 5}}  # but no respondents have gender=3
+targets = {"gender": {1: 50, 2: 50}}          # drop the key, or
+targets = {"education": {..., (4, 5): 10}}    # fold the empty code into a merge
 ```
 
-The engine can't satisfy this target — there's no one to weight. Q surfaces
-this in its Diagnostics Report; rimpy emits a `UserWarning`.
-
-### Behavior
-
-For every `(column, code)` pair where the target is non-zero but the data
-contains zero rows with that code (after `drop_nulls`), rimpy emits:
-
-```
-UserWarning: Target code 3 for column 'gender' has zero rows in data;
-             target (5.0) will be silently dropped from raking.
-```
-
-The rake still runs and returns weights; the unsatisfiable target is just
-silently dropped by the engine (the warning is the user-facing signal that
-this happened).
-
-In `rake_by` and `rake_by_scheme`, detection runs per-group with deterministic
-labels:
-
-- `rake_by`: `Group ('UK'): target code 4 for column 'age' has zero rows...`
-- `rake_by`, multi-column `by`: `Group (country='US', gender=2): target code 4 ...`
-- `rake_by_scheme`, explicit scheme: `Scheme group ('UK'): target code 4 ...`
-- `rake_by_scheme`, default-scheme fallback: `Default-scheme group ('CA'): target code 4 ...`
-
-### Workaround
-
-Set the target to `0` for codes that legitimately don't appear in this wave
-of data:
-
-```python
-targets = {"gender": {1: 50, 2: 50, 3: 0}}  # explicitly says "I know"
-```
-
-A target of `0` on an empty cell is a no-op and doesn't warn. (It also doesn't
-trigger `zero_target_policy` — that only fires when the cell has respondents.)
+Note the pre-0.4 idiom of writing `{3: 0}` for a globally-absent code now
+raises — see §3.
 
 ### Reference
 
-- See `to_be_added.md` item #2 (committed as `ebc3a41`) for the full design.
+- See `to_be_added.md` item #2 (committed as `ebc3a41`) for the original design.
+
+
+## 3. Unknown target keys (`ValueError`)
+
+### The problem
+
+Two footguns produce silently wrong weights if unknown keys are accepted:
+
+```python
+targets = {"education": {1: 33, 2: 20, 3: 33, 4-5: 14}}
+```
+
+Python evaluates the dict key `4-5` as arithmetic **before rimpy ever sees
+it** — the dict that arrives is `{1: 33, 2: 20, 3: 33, -1: 14}`. Pre-0.4,
+rimpy warned on `{-1: 14}` and was completely silent on `{-1: 0}`; the engine
+skipped the unmatched key and produced weights that don't satisfy the user's
+intended marginal.
+
+### Behavior
+
+Any target key absent from the **entire raw data column** raises `ValueError`
+before raking, regardless of its target value. All offenders are aggregated
+into one error, and when an offending key is negative while the column's codes
+are all non-negative, the message explains the arithmetic trap:
+
+```
+ValueError: Unknown target key(s) not present in the data:
+  - column 'education': key -1. Existing categories: [1, 2, 3, 4, 5]
+
+Hint: a negative key like -1 often comes from Python arithmetic inside a
+dict literal — {4-5: 14} is evaluated to {-1: 14} before rimpy sees it.
+To combine categories into one target cell, use tuple syntax: {(4, 5): 14}.
+```
+
+Validation runs **before** `zero_target_policy`, so an unknown key raises
+under every policy mode. String keys and non-integer float keys (e.g. `4.5`
+against an int column) get the same clear error instead of an opaque FFI
+failure. `None` is a valid key only when the column actually contains nulls.
+
+`validate_targets()` / `validate_schemes()` remain advisory: they report
+unknown keys in their `errors` list without raising.
+
+### What other tools do
+
+Q surfaces empty-categories-with-targets as a hard error in its Diagnostics
+Report; R `anesrake` refuses invalid category specs before iterating. rimpy's
+raise matches that camp for globally-absent codes while keeping warnings for
+group-slice absence (§2).
+
+
+## 4. Combined-category tuple keys
+
+### The problem
+
+Combining sparse categories before weighting is routine survey work, but
+pre-0.4 rimpy's targets dict had no syntax for it — users had to recode the
+data column upstream in every notebook.
+
+### Behavior
+
+A tuple key merges its member categories into **one cell** sharing a single
+target:
+
+```python
+targets = {
+    "gender": {1: 50, 2: 50},
+    "education": {1: 33, 2: 24, 3: 33, (4, 5): 10},   # 4 and 5 together = 10%
+}
+```
+
+Every raking iteration applies one shared multiplier to all respondents with
+education 4 *or* 5; the split of the 10% between them follows the data (their
+relative sizes plus what the other dimensions do). This is the same operation
+R `survey` / Q / weightipy users perform by manually recoding — internally
+rimpy builds a temporary recoded column, rakes on it, and drops it from the
+output, so results are **bit-identical to a manual pre-merge**.
+
+Rules:
+
+- Members must be integer codes (int-valued floats like `4.0` are accepted);
+  every category may appear in at most one key — overlapping tuples, or a
+  tuple overlapping a scalar key, raise `ValueError`.
+- A 1-tuple `(4,)` is equivalent to the scalar key `4`.
+- A tuple is valid if **at least one** member exists in the column (combining
+  a category that came back empty is the standard use); individually absent
+  members emit a `UserWarning`. All members absent → `ValueError` (§3).
+- `{(4, 5): 0}` flows through `zero_target_policy` like any zero target on a
+  populated cell (§1); error messages render the tuple, not internal names.
+- In `rake_by_scheme`, different schemes may merge differently on the same
+  column (scheme A `(4, 5)`, scheme B `(3, 4, 5)`) — each pattern gets its own
+  internal recode.
+
+Not yet supported in the Excel/CSV scheme loaders — tuple targets are
+dict-API-only for now (see `to_be_added.md` item #5).

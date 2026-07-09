@@ -7,6 +7,7 @@ All data transfer uses Arrow PyCapsule — no Python lists in the data path.
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -61,8 +62,19 @@ def _normalize_targets(
 def _detect_empty_target_categories(
     df_nw: nw.DataFrame,
     targets: dict[str, dict[Any, float]],
+    *,
+    unique_cache: dict[str, set] | None = None,
 ) -> list[tuple[str, Any, float]]:
     """Return [(column, code, target_value), ...] for non-zero targets with no data rows.
+
+    Codes absent from the entire raw column raise in _validate_target_keys
+    before this runs, so this only catches codes that exist in the column but
+    have zero rows in the frame it is given — i.e. after null-dropping or
+    within a group slice.
+
+    ``unique_cache`` holds already-computed unique sets per column; only pass
+    it when it was computed from the same frame as ``df_nw`` (avoids a second
+    O(n) scan per column). Columns missing from the cache are scanned.
 
     Type coercion: uses Python set membership, which treats numerically equal
     int/float as equal (1 in {1.0} is True).
@@ -71,11 +83,258 @@ def _detect_empty_target_categories(
     for col, props in targets.items():
         if col not in df_nw.columns:
             continue
-        unique_values = set(df_nw.get_column(col).unique().to_list())
+        if unique_cache is not None and col in unique_cache:
+            unique_values = unique_cache[col]
+        else:
+            unique_values = set(df_nw.get_column(col).unique().to_list())
         for code, target_value in props.items():
             if code not in unique_values and target_value != 0:
                 empty.append((col, code, target_value))
     return empty
+
+
+_TUPLE_HINT = (
+    "Hint: a negative key like -1 often comes from Python arithmetic inside a\n"
+    "dict literal — {4-5: 14} is evaluated to {-1: 14} before rimpy sees it.\n"
+    "To combine categories into one target cell, use tuple syntax: {(4, 5): 14}."
+)
+
+
+def _fmt_categories(values: list[Any]) -> str:
+    """Render a column's category values for error messages (sorted, capped at 20)."""
+    try:
+        vals = sorted(values)
+    except TypeError:
+        vals = sorted(values, key=repr)
+    shown = ", ".join(repr(v) for v in vals[:20])
+    if len(vals) > 20:
+        return f"[{shown}, ... ({len(vals)} total)]"
+    return f"[{shown}]"
+
+
+def _normalize_tuple_key(col: str, code: tuple) -> list[int]:
+    """Validate one tuple key and return its members as ints. Raises ValueError."""
+    if len(code) == 0:
+        raise ValueError(f"Empty tuple key () in targets for column '{col}'.")
+    members: list[int] = []
+    for m in code:
+        if not isinstance(m, (int, float)) or (
+            isinstance(m, float) and not m.is_integer()
+        ):
+            raise ValueError(
+                f"Tuple key {code!r} for column '{col}' contains non-integer "
+                f"element {m!r}; tuple members must be integer category codes."
+            )
+        mi = int(m)
+        if mi in members:
+            raise ValueError(
+                f"Tuple key {code!r} for column '{col}' contains duplicate member {mi}."
+            )
+        members.append(mi)
+    return members
+
+
+def _validate_target_keys(
+    df_nw: nw.DataFrame,
+    targets_dict: dict[str, dict[Any, float]],
+    *,
+    context_label: str = "",
+    unique_cache: dict[str, set] | None = None,
+) -> list[tuple[str, tuple, int]]:
+    """Validate every target key against the full raw column (before null-drop).
+
+    Raises ValueError for: unknown scalar keys (regardless of target value —
+    catches the {4-5: 14} → {-1: 14} arithmetic trap), tuples whose members are
+    ALL absent, structurally invalid tuples, and overlapping keys. Raises
+    KeyError if a column carrying tuple keys is missing (cannot expand).
+    Missing columns with scalar-only keys are skipped (the caller's own
+    column check handles them).
+
+    ``unique_cache`` (mutated in place) memoizes each column's unique-value
+    set so repeated calls — per-scheme validation, and the downstream
+    empty-category check when no rows were null-dropped — cost one O(n) scan
+    per column total.
+
+    Returns [(col, tuple_key, absent_member), ...] for tuples where some but
+    not all members are absent — the caller warns on these.
+    """
+    prefix = f"{context_label}: " if context_label else ""
+    offender_lines: list[str] = []
+    add_hint = False
+    absent_members: list[tuple[str, tuple, int]] = []
+
+    for col, props in targets_dict.items():
+        if col not in df_nw.columns:
+            if any(isinstance(c, tuple) for c in props):
+                raise KeyError(
+                    f"Target column '{col}' (with tuple keys) not found in DataFrame"
+                )
+            continue
+        if unique_cache is not None and col in unique_cache:
+            unique_values = unique_cache[col]
+        else:
+            unique_values = set(df_nw.get_column(col).unique().to_list())
+            if unique_cache is not None:
+                unique_cache[col] = unique_values
+        non_null = [v for v in unique_values if v is not None]
+        claimed: dict[int, Any] = {}
+
+        def _claim(code_int: int, key: Any) -> None:
+            if code_int in claimed:
+                other = claimed[code_int]
+                if isinstance(key, tuple) and isinstance(other, tuple):
+                    raise ValueError(
+                        f"{prefix}Overlapping tuple keys for column '{col}': "
+                        f"{other!r} and {key!r} both claim category {code_int}. "
+                        f"Each category may appear in at most one target key."
+                    )
+                scalar, tup = (other, key) if isinstance(key, tuple) else (key, other)
+                raise ValueError(
+                    f"{prefix}Conflicting target keys for column '{col}': "
+                    f"category {code_int} appears both as scalar key {scalar!r} "
+                    f"and inside tuple key {tup!r}."
+                )
+            claimed[code_int] = key
+
+        for code in props:
+            if isinstance(code, tuple):
+                members = _normalize_tuple_key(col, code)
+                for m in members:
+                    _claim(m, code)
+                present = [m for m in members if m in unique_values]
+                if not present:
+                    offender_lines.append(
+                        f"  - {prefix}column '{col}': tuple key {code!r} — none of "
+                        f"its members exist. Existing categories: {_fmt_categories(non_null)}"
+                    )
+                else:
+                    for m in members:
+                        if m not in unique_values:
+                            absent_members.append((col, code, m))
+            else:
+                if isinstance(code, (int, float)) and float(code).is_integer():
+                    _claim(int(code), code)
+                if code not in unique_values:
+                    offender_lines.append(
+                        f"  - {prefix}column '{col}': key {code!r}. "
+                        f"Existing categories: {_fmt_categories(non_null)}"
+                    )
+                    if (
+                        isinstance(code, (int, float))
+                        and code < 0
+                        and all(isinstance(v, (int, float)) and v >= 0 for v in non_null)
+                    ):
+                        add_hint = True
+
+    if offender_lines:
+        msg = "Unknown target key(s) not present in the data:\n" + "\n".join(
+            offender_lines
+        )
+        if add_hint:
+            msg += "\n\n" + _TUPLE_HINT
+        raise ValueError(msg)
+    return absent_members
+
+
+def _expand_tuple_targets(
+    df_nw: nw.DataFrame,
+    targets_dict: dict[str, dict[Any, float]],
+    *,
+    reusable: set[str] | None = None,
+) -> tuple[nw.DataFrame, dict[str, dict[Any, float]], dict[str, tuple[str, dict[int, str]]], list[str]]:
+    """Expand tuple keys into a temporary merged column per (column, pattern).
+
+    Assumes _validate_target_keys passed. For each column with multi-member
+    tuple keys, adds a recoded column where every tuple's members map to the
+    tuple's smallest member (the canonical code — min so that (4,5) and (5,4)
+    agree), and rewrites that column's targets to reference the temp column
+    with scalar keys, preserving key positions (engine iteration order).
+    1-tuples collapse to scalar keys in place. Raking on the temp column is
+    bit-identical to raking on a manually pre-merged column.
+
+    ``reusable`` names temp columns created earlier in the same call chain
+    (rake_by_scheme expands per scheme); an identical (column, pattern) reuses
+    them. Any other pre-existing column with a reserved name raises.
+
+    Returns (df_with_temp_cols, rewritten_targets, merge_labels, new_temp_cols)
+    where merge_labels = {temp_col: (orig_col, {canonical: "(4, 5)"})} for
+    rendering user-facing messages. No tuples -> inputs unchanged, ({}, []).
+    """
+    if not any(
+        isinstance(code, tuple) for props in targets_dict.values() for code in props
+    ):
+        return df_nw, targets_dict, {}, []
+
+    reusable = reusable or set()
+    merge_labels: dict[str, tuple[str, dict[int, str]]] = {}
+    new_temp_cols: list[str] = []
+    new_targets: dict[str, dict[Any, float]] = {}
+
+    for col, props in targets_dict.items():
+        merges = sorted(
+            sorted({int(m) for m in code})
+            for code in props
+            if isinstance(code, tuple) and len(code) > 1
+        )
+        if not merges:
+            if any(isinstance(c, tuple) for c in props):
+                # Only 1-tuples: collapse to scalars, no temp column needed.
+                new_targets[col] = {
+                    (int(c[0]) if isinstance(c, tuple) else c): v
+                    for c, v in props.items()
+                }
+            else:
+                new_targets[col] = props
+            continue
+
+        pattern = ";".join(",".join(map(str, members)) for members in merges)
+        digest = hashlib.sha1(pattern.encode()).hexdigest()[:8]
+        temp_name = f"_rimpy_merged_{col}_{digest}"
+
+        if temp_name in df_nw.columns:
+            if temp_name not in reusable:
+                raise ValueError(
+                    f"Column name '{temp_name}' is reserved by rimpy for internal "
+                    f"category merging; rename it in the input DataFrame."
+                )
+        else:
+            expr: Any = nw.col(col)
+            for members in merges:
+                expr = (
+                    nw.when(nw.col(col).is_in(members))
+                    .then(nw.lit(members[0]))
+                    .otherwise(expr)
+                )
+            df_nw = df_nw.with_columns(expr.alias(temp_name))
+            new_temp_cols.append(temp_name)
+
+        new_props: dict[Any, float] = {}
+        code_labels: dict[int, str] = {}
+        for code, val in props.items():
+            if isinstance(code, tuple) and len(code) > 1:
+                canonical = min(int(m) for m in code)
+                new_props[canonical] = val
+                code_labels[canonical] = repr(code)
+            elif isinstance(code, tuple):
+                new_props[int(code[0])] = val
+            else:
+                new_props[code] = val
+        new_targets[temp_name] = new_props
+        merge_labels[temp_name] = (col, code_labels)
+
+    return df_nw, new_targets, merge_labels, new_temp_cols
+
+
+def _fmt_target(
+    col: str,
+    code: Any,
+    merge_labels: dict[str, tuple[str, dict[int, str]]],
+) -> tuple[str, str]:
+    """Map an (engine column, code) pair back to user-facing display names."""
+    if col in merge_labels:
+        orig_col, code_labels = merge_labels[col]
+        return orig_col, code_labels.get(code, repr(code))
+    return col, repr(code)
 
 
 # Valid values for the zero_target_policy kwarg.
@@ -112,12 +371,15 @@ def _detect_zero_target_on_populated_cell(
 def _format_zero_target_error(
     detected: list[tuple[str, Any, int]],
     context_label: str = "",
+    merge_labels: dict[str, tuple[str, dict[int, str]]] | None = None,
 ) -> str:
     """Build the actionable ValueError message for zero_target_policy='error'."""
+    merge_labels = merge_labels or {}
     first_col, first_code, first_n = detected[0]
+    first_col, first_code_str = _fmt_target(first_col, first_code, merge_labels)
     prefix = f"{context_label}: " if context_label else ""
     lines = [
-        f"{prefix}Target = 0 specified for {first_col} category {first_code!r} "
+        f"{prefix}Target = 0 specified for {first_col} category {first_code_str} "
         f"with {first_n} non-empty respondents.",
         "",
         "rimpy requires explicit handling of zero targets on non-empty cells. Options:",
@@ -134,7 +396,8 @@ def _format_zero_target_error(
         lines.append("")
         lines.append("Additional zero-target cells detected:")
         for col, code, n in detected[1:]:
-            lines.append(f"  - {col} = {code!r}: {n} respondent(s)")
+            disp_col, disp_code = _fmt_target(col, code, merge_labels)
+            lines.append(f"  - {disp_col} = {disp_code}: {n} respondent(s)")
     return "\n".join(lines)
 
 
@@ -162,6 +425,7 @@ def _apply_zero_target_policy(
     near_zero_eps: float,
     *,
     context_label: str = "",
+    merge_labels: dict[str, tuple[str, dict[int, str]]] | None = None,
 ) -> tuple[nw.DataFrame, dict[str, dict[Any, float]], Any]:
     """Apply zero_target_policy. Returns (df_for_engine, modified_targets, keep_mask_or_None).
 
@@ -177,7 +441,7 @@ def _apply_zero_target_policy(
         return df_nw, targets_dict, None
 
     if policy == "error":
-        raise ValueError(_format_zero_target_error(detected, context_label))
+        raise ValueError(_format_zero_target_error(detected, context_label, merge_labels))
 
     if policy == "near_zero":
         new_targets = {col: dict(props) for col, props in targets_dict.items()}
@@ -233,6 +497,14 @@ def rake(
         Can be dict or list of dicts (weightipy-style).
         Values can be proportions (0-1) or percentages (0-100).
         Example: {"gender": {1: 49, 2: 51}, "age": {1: 20, 2: 30, 3: 30, 4: 20}}
+
+        A tuple key combines categories into ONE merged cell sharing a single
+        target: ``{"education": {1: 33, 2: 24, 3: 33, (4, 5): 10}}`` weights
+        categories 4 and 5 together to 10% of the total (one shared raking
+        multiplier; the 4-vs-5 split inside the 10% follows the data). This is
+        exactly equivalent to recoding 4/5 into one code before raking, as
+        done manually in Q or R's survey package. Every category may appear
+        in at most one key.
     max_iterations
         Maximum iterations before stopping.
     convergence_threshold
@@ -291,16 +563,19 @@ def rake(
     Warnings
     --------
     Emits ``UserWarning`` for every ``(column, code)`` pair where a non-zero
-    target proportion is supplied but the data has zero rows with that code
-    (after ``drop_nulls``). The rake still runs; the unsatisfiable target is
-    silently dropped by the engine.
+    target proportion is supplied for a code that exists in the column but has
+    zero rows after ``drop_nulls``, and for tuple members with zero rows. The
+    rake still runs; the unsatisfiable target is silently dropped by the engine.
 
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any target of 0 is
-        supplied for a category that contains respondents. See the
-        ``zero_target_policy`` parameter for resolution options.
+        When any target key is absent from the data column entirely (unknown
+        keys are dict bugs — e.g. ``{4-5: 14}`` is Python arithmetic and
+        reaches rimpy as ``{-1: 14}``; use tuple syntax ``{(4, 5): 14}`` to
+        combine categories). Also when tuple keys are malformed or overlap,
+        and when ``zero_target_policy='error'`` (default) and any target of 0
+        is supplied for a category that contains respondents.
     """
     result_df, _ = rake_with_diagnostics(
         df,
@@ -349,16 +624,18 @@ def rake_with_diagnostics(
     Warnings
     --------
     Emits ``UserWarning`` for every ``(column, code)`` pair where a non-zero
-    target proportion is supplied but the data has zero rows with that code
-    (after ``drop_nulls``). The rake still runs; the unsatisfiable target is
-    silently dropped by the engine.
+    target proportion is supplied for a code that exists in the column but has
+    zero rows after ``drop_nulls``, and for tuple members with zero rows. The
+    rake still runs; the unsatisfiable target is silently dropped by the engine.
 
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any target of 0 is
+        When any target key is absent from the data column entirely, when
+        tuple keys are malformed or overlap, or when
+        ``zero_target_policy='error'`` (default) and any target of 0 is
         supplied for a category that contains respondents. The error message
-        lists the offending cells and the three resolution options.
+        lists the offending cells and the resolution options.
     """
     _validate_zero_target_kwargs(zero_target_policy, near_zero_eps)
 
@@ -376,14 +653,34 @@ def rake_with_diagnostics(
     if total is not None and total <= 0:
         raise ValueError(f"total must be positive, got {total}")
 
+    # Item #4 — reject keys absent from the raw column, then expand tuple keys
+    # into a temporary merged column (dropped from the output at the end).
+    unique_cache: dict[str, set] = {}
+    absent_members = _validate_target_keys(df_nw, targets_dict, unique_cache=unique_cache)
+    for col, tup, member in absent_members:
+        warnings.warn(
+            f"Tuple member {member!r} of key {tup!r} for column '{col}' has "
+            f"zero rows in the data; the merged cell is carried by its other member(s).",
+            UserWarning,
+            stacklevel=_warning_stacklevel,
+        )
+    df_nw, targets_dict, merge_labels, temp_cols = _expand_tuple_targets(df_nw, targets_dict)
+    target_columns = list(targets_dict.keys())
+
     # Item #2 — detect non-zero targets for codes that have zero rows after
     # null-filtering and warn (engine would silently drop them otherwise).
     df_nw_for_check = (
         df_nw.drop_nulls(subset=target_columns) if drop_nulls else df_nw
     )
-    for col, code, val in _detect_empty_target_categories(df_nw_for_check, targets_dict):
+    # The cache is only valid for the check frame if null-dropping removed
+    # nothing; temp columns aren't cached and fall back to a scan either way.
+    cache_for_check = unique_cache if len(df_nw_for_check) == len(df_nw) else None
+    for col, code, val in _detect_empty_target_categories(
+        df_nw_for_check, targets_dict, unique_cache=cache_for_check
+    ):
+        disp_col, disp_code = _fmt_target(col, code, merge_labels)
         warnings.warn(
-            f"Target code {code!r} for column '{col}' has zero rows in data; "
+            f"Target code {disp_code} for column '{disp_col}' has zero rows in data; "
             f"target ({val}) will be silently dropped from raking.",
             UserWarning,
             stacklevel=_warning_stacklevel,
@@ -395,6 +692,7 @@ def rake_with_diagnostics(
         targets_dict,
         zero_target_policy,
         near_zero_eps,
+        merge_labels=merge_labels,
     )
     target_columns = list(targets_dict.keys())
     needs_reassembly = keep_mask is not None
@@ -438,6 +736,9 @@ def rake_with_diagnostics(
         )
         combined = nw.concat([result_df, dropped_df]).sort("_rimpy_row_idx")
         result_df = combined.drop("_rimpy_row_idx")
+
+    if temp_cols:
+        result_df = result_df.drop(*[c for c in temp_cols if c in result_df.columns])
 
     return nw.to_native(result_df), diagnostics
 
@@ -499,8 +800,11 @@ def rake_by(
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any target of 0 is
-        supplied for a category that contains respondents anywhere in the data.
+        When any target key is absent from the data column entirely (a code
+        missing only within one group's slice warns instead), when tuple keys
+        are malformed or overlap, or when ``zero_target_policy='error'``
+        (default) and any target of 0 is supplied for a category that contains
+        respondents anywhere in the data.
     """
     result_df, _ = rake_by_with_diagnostics(
         df,
@@ -556,8 +860,11 @@ def rake_by_with_diagnostics(
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any target of 0 is
-        supplied for a category that contains respondents.
+        When any target key is absent from the data column entirely (a code
+        missing only within one group's slice warns instead), when tuple keys
+        are malformed or overlap, or when ``zero_target_policy='error'``
+        (default) and any target of 0 is supplied for a category that contains
+        respondents.
     """
     _validate_zero_target_kwargs(zero_target_policy, near_zero_eps)
 
@@ -571,6 +878,19 @@ def rake_by_with_diagnostics(
     # Validate total
     if total is not None and total <= 0:
         raise ValueError(f"total must be positive, got {total}")
+
+    # Item #4 — targets are shared across groups, so key validation and tuple
+    # expansion run once against the full column.
+    absent_members = _validate_target_keys(df_nw, targets_dict)
+    for col, tup, member in absent_members:
+        warnings.warn(
+            f"Tuple member {member!r} of key {tup!r} for column '{col}' has "
+            f"zero rows in the data; the merged cell is carried by its other member(s).",
+            UserWarning,
+            stacklevel=_warning_stacklevel,
+        )
+    df_nw, targets_dict, merge_labels, temp_cols = _expand_tuple_targets(df_nw, targets_dict)
+    target_col_names = list(targets_dict.keys())
 
     # Per-group empty-target detection. A code may exist globally but be absent
     # from a specific group's slice — only per-group filtering catches that.
@@ -592,9 +912,10 @@ def rake_by_with_diagnostics(
             group_label_str = ", ".join(f"{c}={combo[c]!r}" for c in by)
 
         for col, code, val in _detect_empty_target_categories(group_df, targets_dict):
+            disp_col, disp_code = _fmt_target(col, code, merge_labels)
             warnings.warn(
-                f"Group ({group_label_str}): target code {code!r} for column "
-                f"'{col}' has zero rows in this group; target ({val}) will be "
+                f"Group ({group_label_str}): target code {disp_code} for column "
+                f"'{disp_col}' has zero rows in this group; target ({val}) will be "
                 f"silently dropped.",
                 UserWarning,
                 stacklevel=_warning_stacklevel,
@@ -611,6 +932,7 @@ def rake_by_with_diagnostics(
         targets_dict,
         zero_target_policy,
         near_zero_eps,
+        merge_labels=merge_labels,
     )
     target_col_names = list(targets_dict.keys())
     needs_reassembly = keep_mask is not None
@@ -650,6 +972,9 @@ def rake_by_with_diagnostics(
         )
         combined = nw.concat([result_df, dropped_df]).sort("_rimpy_row_idx")
         result_df = combined.drop("_rimpy_row_idx")
+
+    if temp_cols:
+        result_df = result_df.drop(*[c for c in temp_cols if c in result_df.columns])
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,
@@ -757,7 +1082,10 @@ def rake_by_scheme(
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any scheme target
+        When any scheme's target key is absent from the data column entirely
+        (a code missing only within that scheme's group slice warns instead),
+        when tuple keys are malformed or overlap within a scheme, or when
+        ``zero_target_policy='error'`` (default) and any scheme target
         of 0 is supplied for a category that contains respondents in that
         scheme's group.
     """
@@ -819,7 +1147,10 @@ def rake_by_scheme_with_diagnostics(
     Raises
     ------
     ValueError
-        When ``zero_target_policy='error'`` (default) and any scheme target
+        When any scheme's target key is absent from the data column entirely
+        (a code missing only within that scheme's group slice warns instead),
+        when tuple keys are malformed or overlap within a scheme, or when
+        ``zero_target_policy='error'`` (default) and any scheme target
         of 0 is supplied for a category that contains respondents in that
         scheme's group.
     """
@@ -844,6 +1175,43 @@ def rake_by_scheme_with_diagnostics(
     if default_scheme is not None:
         normalized_default = _normalize_targets(default_scheme)
 
+    # Item #4 — per-scheme key validation (against the full column) and tuple
+    # expansion. Schemes sharing the same (column, merge pattern) reuse one
+    # temp column; distinct patterns get distinct temp columns, each scheme's
+    # rewritten targets referencing its own.
+    merge_labels: dict[str, tuple[str, dict[int, str]]] = {}
+    all_temp_cols: list[str] = []
+    unique_cache: dict[str, set] = {}
+
+    def _validate_and_expand(
+        scheme_dict: dict[str, dict[Any, float]],
+        label: str,
+    ) -> dict[str, dict[Any, float]]:
+        nonlocal df_nw
+        for col, tup, member in _validate_target_keys(
+            df_nw, scheme_dict, context_label=label, unique_cache=unique_cache
+        ):
+            warnings.warn(
+                f"{label}: tuple member {member!r} of key {tup!r} for column "
+                f"'{col}' has zero rows in the data; the merged cell is carried "
+                f"by its other member(s).",
+                UserWarning,
+                stacklevel=_warning_stacklevel + 1,
+            )
+        df_nw, expanded, labels, new_cols = _expand_tuple_targets(
+            df_nw, scheme_dict, reusable=set(all_temp_cols)
+        )
+        merge_labels.update(labels)
+        all_temp_cols.extend(new_cols)
+        return expanded
+
+    for group_key in list(normalized_schemes.keys()):
+        normalized_schemes[group_key] = _validate_and_expand(
+            normalized_schemes[group_key], f"Scheme group ({group_key!r})"
+        )
+    if normalized_default is not None:
+        normalized_default = _validate_and_expand(normalized_default, "Default-scheme")
+
     # Per-group empty-target detection. Covers both groups with explicit schemes
     # and groups falling back to default_scheme.
     unique_groups = set(df_nw.get_column(by).unique().to_list())
@@ -866,9 +1234,10 @@ def rake_by_scheme_with_diagnostics(
         if drop_nulls:
             group_df = group_df.drop_nulls(subset=list(scheme_dict.keys()))
         for col, code, val in _detect_empty_target_categories(group_df, scheme_dict):
+            disp_col, disp_code = _fmt_target(col, code, merge_labels)
             warnings.warn(
-                f"{scheme_label} group ({group_key!r}): target code {code!r} for "
-                f"column '{col}' has zero rows in this group; target ({val}) "
+                f"{scheme_label} group ({group_key!r}): target code {disp_code} for "
+                f"column '{disp_col}' has zero rows in this group; target ({val}) "
                 f"will be silently dropped.",
                 UserWarning,
                 stacklevel=_warning_stacklevel,
@@ -903,7 +1272,9 @@ def rake_by_scheme_with_diagnostics(
         if zero_target_policy == "error":
             raise ValueError(
                 _format_zero_target_error(
-                    detected, context_label=f"{scheme_label} group ({group_key!r})"
+                    detected,
+                    context_label=f"{scheme_label} group ({group_key!r})",
+                    merge_labels=merge_labels,
                 )
             )
 
@@ -981,6 +1352,11 @@ def rake_by_scheme_with_diagnostics(
         )
         combined = nw.concat([result_df, dropped_df]).sort("_rimpy_row_idx")
         result_df = combined.drop("_rimpy_row_idx")
+
+    if all_temp_cols:
+        result_df = result_df.drop(
+            *[c for c in all_temp_cols if c in result_df.columns]
+        )
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,
@@ -1089,12 +1465,22 @@ def validate_targets(
             continue
 
         unique_values = set(df_nw.get_column(col).unique().to_list())
+        tuple_covered: set[Any] = set()
         for code, target_value in props.items():
-            if code not in unique_values and target_value != 0:
+            if isinstance(code, tuple):
+                tuple_covered.update(code)
+                if (
+                    not any(m in unique_values for m in code)
+                    and target_value != 0
+                ):
+                    warnings.append(
+                        f"Code {code} in targets for '{col}' not found in data"
+                    )
+            elif code not in unique_values and target_value != 0:
                 warnings.append(f"Code {code} in targets for '{col}' not found in data")
 
         for val in unique_values:
-            if val is not None and val not in props:
+            if val is not None and val not in props and val not in tuple_covered:
                 warnings.append(f"Value {val} in column '{col}' has no target")
 
         total = sum(props.values())
@@ -1173,14 +1559,24 @@ def validate_schemes(
                 continue
 
             unique_values = set(df_group.get_column(col).unique().to_list())
+            tuple_covered: set[Any] = set()
             for code, target_value in props.items():
-                if code not in unique_values and target_value != 0:
+                if isinstance(code, tuple):
+                    tuple_covered.update(code)
+                    if (
+                        not any(m in unique_values for m in code)
+                        and target_value != 0
+                    ):
+                        group_warnings.append(
+                            f"Code {code} in targets for '{col}' not found in group data"
+                        )
+                elif code not in unique_values and target_value != 0:
                     group_warnings.append(
                         f"Code {code} in targets for '{col}' not found in group data"
                     )
 
             for val in unique_values:
-                if val is not None and val not in props:
+                if val is not None and val not in props and val not in tuple_covered:
                     group_warnings.append(
                         f"Value {val} in column '{col}' has no target"
                     )

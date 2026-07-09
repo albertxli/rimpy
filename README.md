@@ -345,6 +345,34 @@ targets = [
 
 Values can be proportions (0-1) or percentages (0-100). rimpy auto-detects.
 
+### Combined categories (tuple keys)
+
+A tuple key merges categories into **one cell** sharing a single target — the
+standard way to handle sparse categories without recoding the data upstream:
+
+```python
+targets = {
+    "gender": {1: 50, 2: 50},
+    "education": {1: 33, 2: 24, 3: 33, (4, 5): 10},  # 4 and 5 together = 10%
+}
+```
+
+Categories 4 and 5 receive one shared raking multiplier; how the 10% splits
+between them follows the data (their relative sizes and the other dimensions).
+This is exactly equivalent to recoding 4/5 into a single code before raking —
+the manual workflow in Q or R's `survey` package — and rimpy produces
+bit-identical weights to that manual pre-merge. Each category may appear in at
+most one target key; overlapping keys raise `ValueError`.
+
+### Unknown target keys raise
+
+Any target key that doesn't exist in the data column raises `ValueError`
+before raking (regardless of its target value). This catches the classic
+Python trap where `{"education": {4-5: 14}}` silently evaluates the dict key
+`4-5` to `-1` — the error message lists the column's real categories and
+suggests the tuple syntax above. A code that exists in the column but is
+missing from one group's slice (partial data) warns instead of raising.
+
 ### Converting from weightipy
 
 ```python
@@ -371,8 +399,12 @@ Notable examples include:
   ("weighted % must be 0") is ambiguous in the algorithm and tools disagree on
   how to handle it. rimpy's default refuses with an actionable error; opt-in
   modes (`hard_zero`, `near_zero`) cover the Q / SPSS / weightipy conventions.
-- **Empty target categories** — when a non-zero target is supplied for a
-  category code that doesn't exist in the data. rimpy emits a `UserWarning`.
+- **Unknown target keys** — a key absent from the entire data column raises
+  `ValueError` (it's a targets-dict bug, e.g. the `{4-5: 14}` → `{-1: 14}`
+  arithmetic trap). A code present in the column but empty within one group's
+  slice emits a `UserWarning` instead — that's normal partial data.
+- **Combined categories** — tuple keys like `{(4, 5): 10}` merge categories
+  into one cell; bit-identical to manually recoding before raking.
 
 See **[`edge_cases.md`](edge_cases.md)** for the full treatment of each case,
 the empirical comparison against Q's R-engine output, and recommendations on
