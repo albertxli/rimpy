@@ -392,6 +392,12 @@ targets = [
 
 Values can be proportions (0-1) or percentages (0-100). rimpy auto-detects.
 
+A target of `0` for a category with **no rows in the data** is dropped with a
+warning rather than raised, so a targets dict built straight from a survey code
+frame — which carries every category, including ones nobody fell into — works
+unedited. A *non-zero* target on an absent category still raises, since that is
+a real mismatch.
+
 ### Category codes: numbers or text
 
 Category codes may be integer codes or the labels themselves:

@@ -152,11 +152,11 @@ class TestZeroTargetPolicyDefault:
     def test_zero_target_on_unknown_code_raises_unknown_key(
         self, fixture_320_partyaffiliation_polars
     ):
-        # education code 99 doesn't exist in the data. Since item #4, unknown
-        # keys raise regardless of target value — before zero_target_policy runs.
+        # education code 99 doesn't exist in the data. An unknown key carrying
+        # a real target raises before zero_target_policy runs.
         targets = {
             "gender": {1: 50.0, 2: 50.0},
-            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 1.0, 5: 9.0, 99: 0.0},
+            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 1.0, 5: 4.0, 99: 5.0},
         }
         with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(fixture_320_partyaffiliation_polars, targets)
@@ -551,7 +551,7 @@ class TestZeroTargetPolicyDoesNotBreakItem2:
         # validation runs before zero_target_policy ever sees the targets.
         targets = {
             "gender": {1: 50.0, 2: 50.0},
-            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 0.0, 5: 10.0, 99: 0.0},
+            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 0.0, 5: 5.0, 99: 5.0},
         }
         with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(

@@ -97,11 +97,17 @@ class TestUnknownKeyValidation:
         assert "[1, 2, 3, 4, 5]" in msg
         assert "tuple syntax: {(4, 5): 14}" in msg
 
-    def test_unknown_key_with_zero_target_also_raises(self, edu_df_polars):
-        """The pre-item-#4 `!= 0` loophole is closed: {-1: 0} raises too."""
+    def test_unknown_key_with_zero_target_is_dropped(self, edu_df_polars):
+        """A zero target on an absent category is a satisfied no-op: dropped
+        with a warning naming the code, so a typo is still visible."""
         targets = {"education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 5.0, 5: 5.0, -1: 0.0}}
-        with pytest.raises(ValueError, match=r"Unknown target key"):
+        with warnings.catch_warnings(record=True) as recs:
+            warnings.simplefilter("always")
             rimpy.rake(edu_df_polars, targets)
+        assert any(
+            "Dropped zero target" in str(w.message) and "-1" in str(w.message)
+            for w in recs
+        )
 
     def test_hint_absent_when_data_has_negative_codes(self, edu_df_polars):
         """The arithmetic-trap hint only fires when the data has no negative
@@ -109,15 +115,15 @@ class TestUnknownKeyValidation:
         df = edu_df_polars.with_columns(
             pl.when(pl.col("education") == 5).then(-1).otherwise(pl.col("education")).alias("education")
         )
-        targets = {"education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 5.0, -1: 5.0, -2: 0.0}}
+        targets = {"education": {1: 33.0, 2: 24.0, 3: 31.0, 4: 5.0, -1: 5.0, -2: 2.0}}
         with pytest.raises(ValueError, match=r"Unknown target key") as excinfo:
             rimpy.rake(df, targets)
         assert "tuple syntax" not in str(excinfo.value)
 
     def test_multiple_unknown_keys_aggregated_in_one_error(self, edu_df_polars):
         targets = {
-            "gender": {1: 50.0, 2: 50.0, 9: 0.0},
-            "education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 5.0, 5: 5.0, -1: 0.0},
+            "gender": {1: 45.0, 2: 50.0, 9: 5.0},
+            "education": {1: 33.0, 2: 24.0, 3: 31.0, 4: 5.0, 5: 5.0, -1: 2.0},
         }
         with pytest.raises(ValueError) as excinfo:
             rimpy.rake(edu_df_polars, targets)
@@ -127,9 +133,9 @@ class TestUnknownKeyValidation:
 
     @pytest.mark.parametrize("policy", ["hard_zero", "near_zero"])
     def test_unknown_key_raises_before_zero_target_policy(self, edu_df_polars, policy):
-        """Key validation runs before zero_target_policy — a zero-valued
-        unknown key raises instead of being absorbed by the policy."""
-        targets = {"education": {1: 33.0, 2: 24.0, 3: 33.0, 4: 5.0, 5: 5.0, -1: 0.0}}
+        """Key validation runs before zero_target_policy — an unknown key
+        raises instead of being absorbed by the policy."""
+        targets = {"education": {1: 33.0, 2: 24.0, 3: 31.0, 4: 5.0, 5: 5.0, -1: 2.0}}
         with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(edu_df_polars, targets, zero_target_policy=policy)
 
@@ -140,14 +146,18 @@ class TestUnknownKeyValidation:
             rimpy.rake(edu_df_polars, {"education": {"a": 50.0, 1: 50.0}})
 
     def test_none_key_valid_iff_column_has_nulls(self, edu_df_polars):
-        """{None: 0} works on a column with nulls (existing hard_zero workflow)
-        but raises on a null-free column (was a latent FFI crash)."""
-        with pytest.raises(ValueError, match=r"Unknown target key"):
+        """{None: 0} works on a column with nulls (existing hard_zero workflow).
+        On a null-free column the None key is a zero target for a category with
+        no rows, so it is dropped with a warning — which also keeps it away from
+        the FFI, where a None key used to crash."""
+        with warnings.catch_warnings(record=True) as recs:
+            warnings.simplefilter("always")
             rimpy.rake(
                 edu_df_polars,
                 {"gender": {1: 50.0, 2: 50.0, None: 0.0}},
                 zero_target_policy="hard_zero",
             )
+        assert any("Dropped zero target" in str(w.message) for w in recs)
 
         df_with_nulls = edu_df_polars.with_columns(
             pl.when(pl.col("education") == 5).then(None).otherwise(pl.col("gender")).alias("gender")
@@ -195,7 +205,7 @@ class TestUnknownKeyValidation:
     def test_rake_by_scheme_error_identifies_scheme(self, edu_df_polars):
         schemes = {
             "US": {"gender": {1: 50.0, 2: 50.0}},
-            "UK": {"gender": {1: 50.0, 2: 50.0, 9: 0.0}},
+            "UK": {"gender": {1: 45.0, 2: 50.0, 9: 5.0}},
         }
         with pytest.raises(ValueError, match=r"Scheme group \('UK'\)"):
             rimpy.rake_by_scheme(edu_df_polars, schemes, by="country")
@@ -284,10 +294,22 @@ class TestTupleTargets:
     def test_all_members_missing_raises(self, edu_df_polars):
         targets = {
             "gender": {1: 50.0, 2: 50.0},
-            "education": {1: 40.0, 2: 30.0, 3: 30.0, (8, 9): 0.0},
+            "education": {1: 40.0, 2: 30.0, 3: 20.0, (8, 9): 10.0},
         }
         with pytest.raises(ValueError, match=r"none of its members exist"):
             rimpy.rake(edu_df_polars, targets)
+
+    def test_all_members_missing_with_zero_target_is_dropped(self, edu_df_polars):
+        """Same no-op rule as a scalar: a merged cell targeting 0% whose members
+        have no rows is dropped, not raised."""
+        targets = {
+            "gender": {1: 50.0, 2: 50.0},
+            "education": {1: 40.0, 2: 30.0, 3: 30.0, (8, 9): 0.0},
+        }
+        with warnings.catch_warnings(record=True) as recs:
+            warnings.simplefilter("always")
+            rimpy.rake(edu_df_polars, targets)
+        assert any("Dropped zero target" in str(w.message) for w in recs)
 
     @pytest.mark.parametrize(
         "bad_props, match",

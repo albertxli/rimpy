@@ -187,15 +187,25 @@ def _validate_target_keys(
     *,
     context_label: str = "",
     unique_cache: dict[str, set] | None = None,
-) -> list[tuple[str, tuple, int]]:
+) -> tuple[list[tuple[str, tuple, Any]], list[tuple[str, Any]]]:
     """Validate every target key against the full raw column (before null-drop).
 
-    Raises ValueError for: unknown scalar keys (regardless of target value —
-    catches the {4-5: 14} → {-1: 14} arithmetic trap), tuples whose members are
-    ALL absent, structurally invalid tuples, and overlapping keys. Raises
+    Returns ``(absent_tuple_members, absent_zero_keys)``.
+
+    Raises ValueError for: unknown scalar keys carrying a non-zero target
+    (catches the {4-5: 14} → {-1: 14} arithmetic trap), tuples with a non-zero
+    target whose members are ALL absent, structurally invalid tuples, and
+    overlapping keys. Raises
     KeyError if a column carrying tuple keys is missing (cannot expand).
     Missing columns with scalar-only keys are skipped (the caller's own
     column check handles them).
+
+    A key whose target is exactly 0 and whose category is absent from the data
+    is a satisfied no-op — survey code frames routinely carry every category,
+    so targets built from one legitimately contain zeros for categories nobody
+    fell into. Those are returned in ``absent_zero_keys`` for the caller to drop
+    and warn about, rather than raised. The arithmetic trap is unaffected: it
+    produces a non-zero target.
 
     ``unique_cache`` (mutated in place) memoizes each column's unique-value
     set so repeated calls — per-scheme validation, and the downstream
@@ -209,6 +219,7 @@ def _validate_target_keys(
     offender_lines: list[str] = []
     add_hint = False
     absent_members: list[tuple[str, tuple, Any]] = []
+    absent_zero: list[tuple[str, Any]] = []
 
     for col, props in targets_dict.items():
         if col not in df_nw.columns:
@@ -243,17 +254,24 @@ def _validate_target_keys(
                 )
             claimed[code_int] = key
 
-        for code in props:
+        for code, target_value in props.items():
+            # A zero target on a category nobody fell into asserts nothing that
+            # is not already true, so it is dropped rather than raised.
+            absent_is_harmless = target_value == 0
+
             if isinstance(code, tuple):
                 members = _normalize_tuple_key(col, code)
                 for m in members:
                     _claim(m, code)
                 present = [m for m in members if m in unique_values]
                 if not present:
-                    offender_lines.append(
-                        f"  - {prefix}column '{col}': tuple key {code!r} — none of "
-                        f"its members exist. Existing categories: {_fmt_categories(non_null)}"
-                    )
+                    if absent_is_harmless:
+                        absent_zero.append((col, code))
+                    else:
+                        offender_lines.append(
+                            f"  - {prefix}column '{col}': tuple key {code!r} — none of "
+                            f"its members exist. Existing categories: {_fmt_categories(non_null)}"
+                        )
                 else:
                     for m in members:
                         if m not in unique_values:
@@ -261,9 +279,14 @@ def _validate_target_keys(
             else:
                 # Claim every hashable scalar, not just numeric ones: a string
                 # key left unclaimed would let {"Male": 49, ("Male","Other"): 51}
-                # slip past overlap detection and silently mis-recode.
+                # slip past overlap detection and silently mis-recode. Claiming
+                # happens before the presence check so that
+                # {1: 0.0, (1, 2): 30.0} still raises as an overlap.
                 _claim(_claim_key(code), code)
                 if code not in unique_values:
+                    if absent_is_harmless:
+                        absent_zero.append((col, code))
+                        continue
                     offender_lines.append(
                         f"  - {prefix}column '{col}': key {code!r}. "
                         f"Existing categories: {_fmt_categories(non_null)}"
@@ -282,7 +305,85 @@ def _validate_target_keys(
         if add_hint:
             msg += "\n\n" + _TUPLE_HINT
         raise ValueError(msg)
-    return absent_members
+    return absent_members, absent_zero
+
+
+def _warn_on_empty_groups(
+    group_diags: dict[Any, Any],
+    columns: Any,
+    *,
+    stacklevel: int,
+) -> None:
+    """Warn for any group whose rows were all dropped as null.
+
+    A group only exists in the diagnostics if it had at least one row, so
+    n_valid == 0 means null-dropping removed every one of them. Left silent,
+    that group comes back with weight 1.0 and converged=True, which reads as a
+    successful run on unweighted data.
+    """
+    empty = [key for key, res in group_diags.items() if res.n_valid == 0]
+    if not empty:
+        return
+    shown = ", ".join(repr(k) for k in empty[:10])
+    more = f" (and {len(empty) - 10} more)" if len(empty) > 10 else ""
+    warnings.warn(
+        f"{len(empty)} group(s) had every row dropped as null and were left "
+        f"unweighted (weight 1.0): {shown}{more}. Check for nulls in that "
+        f"group's target column(s): {list(columns)}. Pass drop_nulls=False to "
+        f"keep such rows.",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _drop_absent_zero_targets(
+    targets_dict: dict[str, dict[Any, float]],
+    absent_zero: list[tuple[str, Any]],
+    *,
+    label: str,
+    stacklevel: int,
+) -> dict[str, dict[Any, float]]:
+    """Drop zero targets whose category has no rows, warning once per column.
+
+    Returns a NEW dict. `_normalize_targets` hands a plain dict straight back to
+    the caller, so the object here may be the user's own targets — mutating it
+    would corrupt their variable between calls.
+    """
+    if not absent_zero:
+        return targets_dict
+
+    dropped: dict[str, list[Any]] = {}
+    for col, code in absent_zero:
+        dropped.setdefault(col, []).append(code)
+
+    new_targets: dict[str, dict[Any, float]] = {}
+    emptied: list[str] = []
+    for col, props in targets_dict.items():
+        if col not in dropped:
+            new_targets[col] = props
+            continue
+        kept = {k: v for k, v in props.items() if k not in dropped[col]}
+        # A column with nothing left would reach the engine with no targets.
+        if kept:
+            new_targets[col] = kept
+        else:
+            emptied.append(col)
+
+    prefix = f"{label}: " if label else ""
+    for col, codes in dropped.items():
+        shown = ", ".join(repr(c) for c in codes)
+        tail = (
+            f" Column '{col}' has no targets left and will not be raked."
+            if col in emptied
+            else ""
+        )
+        warnings.warn(
+            f"{prefix}Dropped zero target(s) for column '{col}' category "
+            f"{shown}: no rows in the data have them.{tail}",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+    return new_targets
 
 
 def _expand_tuple_targets(
@@ -711,7 +812,13 @@ def rake_with_diagnostics(
     # Item #4 — reject keys absent from the raw column, then expand tuple keys
     # into a temporary merged column (dropped from the output at the end).
     unique_cache: dict[str, set] = {}
-    absent_members = _validate_target_keys(df_nw, targets_dict, unique_cache=unique_cache)
+    absent_members, absent_zero = _validate_target_keys(
+        df_nw, targets_dict, unique_cache=unique_cache
+    )
+    targets_dict = _drop_absent_zero_targets(
+        targets_dict, absent_zero, label="", stacklevel=_warning_stacklevel
+    )
+    target_columns = list(targets_dict.keys())
     for col, tup, member in absent_members:
         warnings.warn(
             f"Tuple member {member!r} of key {tup!r} for column '{col}' has "
@@ -936,7 +1043,10 @@ def rake_by_with_diagnostics(
 
     # Item #4 — targets are shared across groups, so key validation and tuple
     # expansion run once against the full column.
-    absent_members = _validate_target_keys(df_nw, targets_dict)
+    absent_members, absent_zero = _validate_target_keys(df_nw, targets_dict)
+    targets_dict = _drop_absent_zero_targets(
+        targets_dict, absent_zero, label="", stacklevel=_warning_stacklevel
+    )
     for col, tup, member in absent_members:
         warnings.warn(
             f"Tuple member {member!r} of key {tup!r} for column '{col}' has "
@@ -1030,6 +1140,10 @@ def rake_by_with_diagnostics(
 
     if temp_cols:
         result_df = result_df.drop(*[c for c in temp_cols if c in result_df.columns])
+
+    _warn_on_empty_groups(
+        group_diags_dict, target_col_names, stacklevel=_warning_stacklevel
+    )
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,
@@ -1243,9 +1357,10 @@ def rake_by_scheme_with_diagnostics(
         label: str,
     ) -> dict[str, dict[Any, float]]:
         nonlocal df_nw
-        for col, tup, member in _validate_target_keys(
+        absent_members, absent_zero = _validate_target_keys(
             df_nw, scheme_dict, context_label=label, unique_cache=unique_cache
-        ):
+        )
+        for col, tup, member in absent_members:
             warnings.warn(
                 f"{label}: tuple member {member!r} of key {tup!r} for column "
                 f"'{col}' has zero rows in the data; the merged cell is carried "
@@ -1253,6 +1368,9 @@ def rake_by_scheme_with_diagnostics(
                 UserWarning,
                 stacklevel=_warning_stacklevel + 1,
             )
+        scheme_dict = _drop_absent_zero_targets(
+            scheme_dict, absent_zero, label=label, stacklevel=_warning_stacklevel + 1
+        )
         df_nw, expanded, labels, new_cols = _expand_tuple_targets(
             df_nw, scheme_dict, reusable=set(all_temp_cols)
         )
@@ -1412,6 +1530,12 @@ def rake_by_scheme_with_diagnostics(
         result_df = result_df.drop(
             *[c for c in all_temp_cols if c in result_df.columns]
         )
+
+    _warn_on_empty_groups(
+        group_diags_dict,
+        sorted({c for sch in normalized_schemes.values() for c in sch}),
+        stacklevel=_warning_stacklevel,
+    )
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,

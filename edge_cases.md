@@ -287,8 +287,10 @@ targets = {"gender": {1: 50, 2: 50}}          # drop the key, or
 targets = {"education": {..., (4, 5): 10}}    # fold the empty code into a merge
 ```
 
-Note the pre-0.4 idiom of writing `{3: 0}` for a globally-absent code now
-raises — see §3.
+Writing `{3: 0}` for a globally-absent code is fine: as of 0.4.1 a zero
+target on a category with no rows is dropped with a warning rather than raised,
+so targets built from a survey code frame — which carries every category — run
+unedited. See §3.
 
 ### Reference
 
@@ -313,7 +315,8 @@ intended marginal.
 
 ### Behavior
 
-Any target key absent from the **entire raw data column** raises `ValueError`
+Any target key absent from the **entire raw data column** and carrying a
+**non-zero** target raises `ValueError`
 before raking, regardless of its target value. All offenders are aggregated
 into one error, and when an offending key is negative while the column's codes
 are all non-negative, the message explains the arithmetic trap:
@@ -334,6 +337,25 @@ failure. `None` is a valid key only when the column actually contains nulls.
 
 `validate_targets()` / `validate_schemes()` remain advisory: they report
 unknown keys in their `errors` list without raising.
+
+### Zero targets on absent categories are dropped, not raised
+
+A key whose target is exactly `0` and whose category has no rows asserts
+nothing that is not already true, so since 0.4.1 it is removed from the targets
+with a `UserWarning` naming the column and code:
+
+```
+Dropped zero target(s) for column 'D1' category 1: no rows in the data have them.
+```
+
+This is what lets a code frame be used directly as a targets dict. The
+arithmetic trap above is untouched, because `{4-5: 14}` produces a *non-zero*
+target. A typo'd code with a zero target is still visible in the warning. If a
+column loses every one of its targets this way, the column is dropped from the
+rake and the warning says so.
+
+The same rule applies to a tuple key whose members are all absent: zero target
+drops, non-zero raises.
 
 ### What other tools do
 

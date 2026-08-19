@@ -9,6 +9,7 @@
 //!   2. `rake_on_batch` — single-group raking with null handling + total scaling
 //!   3. `rake_batch*` — high-level orchestrators returning RecordBatch with weight column
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -664,22 +665,46 @@ pub fn rake_batch_by_scheme(
     };
     let default_scheme = default_scheme.as_ref();
 
-    // Build valid mask (across ALL target columns that exist)
-    let existing_target_cols: Vec<String> = all_target_cols
-        .iter()
-        .filter(|c| all_columns.contains_key(c.as_str()))
-        .cloned()
-        .collect();
-    let valid_mask = if drop_nulls {
-        build_valid_mask(batch, &existing_target_cols)?
-    } else {
-        vec![true; n_rows]
+    // Build one valid mask per distinct scheme column-set.
+    //
+    // A single mask over the union of every scheme's columns would require each
+    // row to be non-null in every *other* scheme's columns too. With
+    // market-specific variables (D5IT populated only for Italy, D5ES only for
+    // Spain) no row can satisfy that, so every group ends up empty and every
+    // weight silently stays 1.0. Null-dropping has to be scoped to the columns
+    // the group is actually raked on -- which is what the Python layer already
+    // does for its empty-category warnings.
+    //
+    // Keyed on the sorted column list so schemes sharing a column set share one
+    // mask, and so the key cannot collide the way a joined string could.
+    let mask_key = |targets: &IndexMap<String, HashMap<i64, f64>>| -> Vec<String> {
+        let mut cols: Vec<String> = targets
+            .keys()
+            .filter(|c| all_columns.contains_key(c.as_str()))
+            .cloned()
+            .collect();
+        cols.sort_unstable();
+        cols
     };
+
+    let mut masks: HashMap<Vec<String>, Vec<bool>> = HashMap::new();
+    for targets in schemes.values().chain(default_scheme) {
+        if let Entry::Vacant(slot) = masks.entry(mask_key(targets)) {
+            let mask = if drop_nulls {
+                build_valid_mask(batch, slot.key())?
+            } else {
+                vec![true; n_rows]
+            };
+            slot.insert(mask);
+        }
+    }
+    // Groups with no scheme are never raked, so nothing is dropped for them.
+    let all_valid: Vec<bool> = vec![true; n_rows];
 
     // Process each group in parallel
     let group_entries: Vec<(String, Vec<usize>)> = group_row_indices.into_iter().collect();
 
-    let group_results: Vec<(String, Vec<usize>, RakeResult)> = group_entries
+    let group_results: Vec<(String, Vec<usize>, Vec<usize>, RakeResult)> = group_entries
         .into_par_iter()
         .map(|(key, row_indices)| {
             // Look up targets for this group
@@ -697,23 +722,25 @@ pub fn rake_batch_by_scheme(
                             weight_min: 1.0,
                             weight_max: 1.0,
                         };
-                        return Ok((key, row_indices, result));
+                        let valid = row_indices.clone();
+                        return Ok((key, row_indices, valid, result));
                     }
                 },
             };
 
             let target_columns: Vec<String> = group_targets.keys().cloned().collect();
+            let mask = masks.get(&mask_key(&group_targets)).unwrap_or(&all_valid);
 
-            let (_, result) = rake_group(
+            let (valid_indices, result) = rake_group(
                 &row_indices,
                 &all_columns,
                 &target_columns,
                 &group_targets,
-                &valid_mask,
+                mask,
                 opts,
             )?;
 
-            Ok((key, row_indices, result))
+            Ok((key, row_indices, valid_indices, result))
         })
         .collect::<Result<_, String>>()?;
 
@@ -721,13 +748,7 @@ pub fn rake_batch_by_scheme(
     let mut full_weights = vec![1.0_f64; n_rows];
     let mut diagnostics: Vec<GroupRakeResult> = Vec::new();
 
-    for (key, row_indices, result) in &group_results {
-        let valid_indices: Vec<usize> = row_indices
-            .iter()
-            .filter(|&&i| valid_mask[i])
-            .copied()
-            .collect();
-
+    for (key, _row_indices, valid_indices, result) in &group_results {
         for (i, &idx) in valid_indices.iter().enumerate() {
             if i < result.weights.len() {
                 full_weights[idx] = result.weights[i];
@@ -750,7 +771,7 @@ pub fn rake_batch_by_scheme(
             gt.clone()
         };
 
-        for (group_key, row_indices, _result) in group_results.iter() {
+        for (group_key, row_indices, _valid, _result) in group_results.iter() {
             if let Some(&target_prop) = normalized.get(group_key) {
                 let target_sum = target_prop * n_rows as f64;
                 let current_sum: f64 = row_indices.iter().map(|&i| full_weights[i]).sum();

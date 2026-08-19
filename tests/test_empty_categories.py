@@ -205,20 +205,33 @@ class TestRakeEmptyCategories:
             rimpy.rake(df, {"gender": {1.0: 50.0, 2.0: 50.0}})
         assert len(_empty_cat_warnings(recs)) == 0
 
-        # Missing code raises regardless of target value — the != 0 loophole
-        # that let {3.0: 0.0} through silently is closed.
+        # A missing code carrying a real target still raises.
         with pytest.raises(ValueError, match=r"Unknown target key"):
-            rimpy.rake(df, {"gender": {1.0: 50.0, 2.0: 50.0, 3.0: 0.0}})
+            rimpy.rake(df, {"gender": {1.0: 45.0, 2.0: 50.0, 3.0: 5.0}})
 
         with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(df, {"gender": {1.0: 40.0, 2.0: 40.0, 3.0: 20.0}})
 
-    def test_zero_target_for_missing_code_raises(
+    def test_zero_target_for_missing_code_is_dropped(
         self, survey_df_with_gaps_polars
     ):
-        """target_value == 0 for a globally missing code raises like any other
-        unknown key — an absent code is a dict bug regardless of its value."""
+        """0% for a category nobody fell into asserts nothing untrue, so it is
+        dropped with a warning rather than raised. Survey code frames carry
+        every category, so targets built from one legitimately contain these."""
         targets = {"gender": {1: 50.0, 2: 50.0, 3: 0.0}}
+        with warnings.catch_warnings(record=True) as recs:
+            warnings.simplefilter("always")
+            result = rimpy.rake(survey_df_with_gaps_polars, targets)
+        msgs = [str(w.message) for w in recs]
+        assert any("Dropped zero target" in m and "3" in m for m in msgs)
+        assert "weight" in result.columns
+
+    def test_nonzero_target_for_missing_code_still_raises(
+        self, survey_df_with_gaps_polars
+    ):
+        """The typo case is unchanged: an absent code with a real target is a
+        bug in the targets dict."""
+        targets = {"gender": {1: 50.0, 2: 45.0, 3: 5.0}}
         with pytest.raises(ValueError, match=r"Unknown target key"):
             rimpy.rake(survey_df_with_gaps_polars, targets)
 
