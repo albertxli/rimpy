@@ -385,5 +385,8 @@ Rules:
   column (scheme A `(4, 5)`, scheme B `(3, 4, 5)`) — each pattern gets its own
   internal recode.
 
-Not yet supported in the Excel/CSV scheme loaders — tuple targets are
-dict-API-only for now (see `to_be_added.md` item #5).
+Supported in `load_targets` via the optional `combine` column: rows sharing a
+tag within the same `(split_value, target_var)` become one tuple key. Tuple
+members are emitted sorted, so `(4, 5)` regardless of row order. Members may
+be text on a text column — `("Low", "Mid")` — but must not mix labels with
+numbers.

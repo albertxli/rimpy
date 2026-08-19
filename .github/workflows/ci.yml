@@ -46,7 +46,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
-        run: uv pip install --system maturin pytest polars pandas pyarrow narwhals
+        run: uv pip install --system maturin pytest polars pandas pyarrow narwhals fastexcel xlsxwriter
 
       - name: Build and install
         run: maturin build --release -o dist && uv pip install --system dist/*.whl

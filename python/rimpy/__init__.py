@@ -36,7 +36,7 @@ from ._rake import (
     weight_summary,
 )
 from ._engine import RakeResult
-from ._loaders import load_schemes, load_schemes_wide
+from ._loaders import load_targets
 
 try:
     __version__ = version("rimpy")
@@ -57,8 +57,7 @@ __all__ = [
     "validate_schemes",
     "convert_from_weightipy",
     # Loaders
-    "load_schemes",
-    "load_schemes_wide",
+    "load_targets",
     # Result types
     "RakeResult",
     "GroupedRakeResult",

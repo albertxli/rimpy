@@ -8,6 +8,7 @@ All data transfer uses Arrow PyCapsule — no Python lists in the data path.
 from __future__ import annotations
 
 import hashlib
+import json
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -112,25 +113,71 @@ def _fmt_categories(values: list[Any]) -> str:
     return f"[{shown}]"
 
 
-def _normalize_tuple_key(col: str, code: tuple) -> list[int]:
-    """Validate one tuple key and return its members as ints. Raises ValueError."""
+def _sort_key(code: Any) -> tuple[int, Any]:
+    """Order codes of one column deterministically.
+
+    Members of a tuple key are homogeneous (enforced by _normalize_tuple_key),
+    so this only has to be consistent, not cross-type meaningful. The leading
+    flag keeps it total anyway.
+    """
+    return (1, code) if isinstance(code, str) else (0, code)
+
+
+def _claim_key(code: Any) -> Any:
+    """Canonical identity for a scalar target key.
+
+    Narrows integral floats to int so 4 and 4.0 claim the same category;
+    everything else (labels included) is its own identity.
+    """
+    if isinstance(code, (int, float)) and not isinstance(code, bool):
+        try:
+            if float(code).is_integer():
+                return int(code)
+        except (OverflowError, ValueError):
+            pass
+    return code
+
+
+def _normalize_tuple_key(col: str, code: tuple) -> list[Any]:
+    """Validate one tuple key and return its members. Raises ValueError.
+
+    Members may be integer codes or category labels, but not a mixture — the
+    column holds one or the other, and a mixed tuple could never be recoded
+    coherently. Integral floats are narrowed to int so 4.0 and 4 claim the same
+    category.
+    """
     if len(code) == 0:
         raise ValueError(f"Empty tuple key () in targets for column '{col}'.")
-    members: list[int] = []
+
+    members: list[Any] = []
     for m in code:
-        if not isinstance(m, (int, float)) or (
-            isinstance(m, float) and not m.is_integer()
-        ):
+        if isinstance(m, str):
+            mi: Any = m
+        elif isinstance(m, (int, float)) and not isinstance(m, bool):
+            if isinstance(m, float) and not m.is_integer():
+                raise ValueError(
+                    f"Tuple key {code!r} for column '{col}' contains non-integer "
+                    f"element {m!r}; numeric tuple members must be integer "
+                    f"category codes."
+                )
+            mi = int(m)
+        else:
             raise ValueError(
-                f"Tuple key {code!r} for column '{col}' contains non-integer "
-                f"element {m!r}; tuple members must be integer category codes."
+                f"Tuple key {code!r} for column '{col}' contains unusable "
+                f"element {m!r}; tuple members must be integer category codes "
+                f"or category labels."
             )
-        mi = int(m)
         if mi in members:
             raise ValueError(
-                f"Tuple key {code!r} for column '{col}' contains duplicate member {mi}."
+                f"Tuple key {code!r} for column '{col}' contains duplicate member {mi!r}."
             )
         members.append(mi)
+
+    if len({isinstance(m, str) for m in members}) > 1:
+        raise ValueError(
+            f"Tuple key {code!r} for column '{col}' mixes category labels with "
+            f"numeric codes; a column holds one or the other."
+        )
     return members
 
 
@@ -161,7 +208,7 @@ def _validate_target_keys(
     prefix = f"{context_label}: " if context_label else ""
     offender_lines: list[str] = []
     add_hint = False
-    absent_members: list[tuple[str, tuple, int]] = []
+    absent_members: list[tuple[str, tuple, Any]] = []
 
     for col, props in targets_dict.items():
         if col not in df_nw.columns:
@@ -177,21 +224,21 @@ def _validate_target_keys(
             if unique_cache is not None:
                 unique_cache[col] = unique_values
         non_null = [v for v in unique_values if v is not None]
-        claimed: dict[int, Any] = {}
+        claimed: dict[Any, Any] = {}
 
-        def _claim(code_int: int, key: Any) -> None:
+        def _claim(code_int: Any, key: Any) -> None:
             if code_int in claimed:
                 other = claimed[code_int]
                 if isinstance(key, tuple) and isinstance(other, tuple):
                     raise ValueError(
                         f"{prefix}Overlapping tuple keys for column '{col}': "
-                        f"{other!r} and {key!r} both claim category {code_int}. "
+                        f"{other!r} and {key!r} both claim category {code_int!r}. "
                         f"Each category may appear in at most one target key."
                     )
                 scalar, tup = (other, key) if isinstance(key, tuple) else (key, other)
                 raise ValueError(
                     f"{prefix}Conflicting target keys for column '{col}': "
-                    f"category {code_int} appears both as scalar key {scalar!r} "
+                    f"category {code_int!r} appears both as scalar key {scalar!r} "
                     f"and inside tuple key {tup!r}."
                 )
             claimed[code_int] = key
@@ -212,8 +259,10 @@ def _validate_target_keys(
                         if m not in unique_values:
                             absent_members.append((col, code, m))
             else:
-                if isinstance(code, (int, float)) and float(code).is_integer():
-                    _claim(int(code), code)
+                # Claim every hashable scalar, not just numeric ones: a string
+                # key left unclaimed would let {"Male": 49, ("Male","Other"): 51}
+                # slip past overlap detection and silently mis-recode.
+                _claim(_claim_key(code), code)
                 if code not in unique_values:
                     offender_lines.append(
                         f"  - {prefix}column '{col}': key {code!r}. "
@@ -241,7 +290,7 @@ def _expand_tuple_targets(
     targets_dict: dict[str, dict[Any, float]],
     *,
     reusable: set[str] | None = None,
-) -> tuple[nw.DataFrame, dict[str, dict[Any, float]], dict[str, tuple[str, dict[int, str]]], list[str]]:
+) -> tuple[nw.DataFrame, dict[str, dict[Any, float]], dict[str, tuple[str, dict[Any, str]]], list[str]]:
     """Expand tuple keys into a temporary merged column per (column, pattern).
 
     Assumes _validate_target_keys passed. For each column with multi-member
@@ -266,28 +315,30 @@ def _expand_tuple_targets(
         return df_nw, targets_dict, {}, []
 
     reusable = reusable or set()
-    merge_labels: dict[str, tuple[str, dict[int, str]]] = {}
+    merge_labels: dict[str, tuple[str, dict[Any, str]]] = {}
     new_temp_cols: list[str] = []
     new_targets: dict[str, dict[Any, float]] = {}
 
     for col, props in targets_dict.items():
         merges = sorted(
-            sorted({int(m) for m in code})
-            for code in props
-            if isinstance(code, tuple) and len(code) > 1
+            (
+                sorted(set(_normalize_tuple_key(col, code)), key=_sort_key)
+                for code in props
+                if isinstance(code, tuple) and len(code) > 1
+            ),
+            key=lambda members: [_sort_key(m) for m in members],
         )
         if not merges:
             if any(isinstance(c, tuple) for c in props):
                 # Only 1-tuples: collapse to scalars, no temp column needed.
                 new_targets[col] = {
-                    (int(c[0]) if isinstance(c, tuple) else c): v
-                    for c, v in props.items()
+                    (c[0] if isinstance(c, tuple) else c): v for c, v in props.items()
                 }
             else:
                 new_targets[col] = props
             continue
 
-        pattern = ";".join(",".join(map(str, members)) for members in merges)
+        pattern = json.dumps(merges, default=repr)
         digest = hashlib.sha1(pattern.encode()).hexdigest()[:8]
         temp_name = f"_rimpy_merged_{col}_{digest}"
 
@@ -298,25 +349,29 @@ def _expand_tuple_targets(
                     f"category merging; rename it in the input DataFrame."
                 )
         else:
-            expr: Any = nw.col(col)
+            # Categorical/Enum columns will not unify with a plain String
+            # literal in a when/then chain, so merge over a String view of the
+            # column; the Arrow layer codes strings either way.
+            dtype = df_nw.collect_schema()[col]
+            base: Any = nw.col(col)
+            if dtype == nw.Categorical or dtype == nw.Enum:
+                base = base.cast(nw.String)
+
+            expr: Any = base
             for members in merges:
-                expr = (
-                    nw.when(nw.col(col).is_in(members))
-                    .then(nw.lit(members[0]))
-                    .otherwise(expr)
-                )
+                expr = nw.when(base.is_in(members)).then(nw.lit(members[0])).otherwise(expr)
             df_nw = df_nw.with_columns(expr.alias(temp_name))
             new_temp_cols.append(temp_name)
 
         new_props: dict[Any, float] = {}
-        code_labels: dict[int, str] = {}
+        code_labels: dict[Any, str] = {}
         for code, val in props.items():
             if isinstance(code, tuple) and len(code) > 1:
-                canonical = min(int(m) for m in code)
+                canonical = min(_normalize_tuple_key(col, code), key=_sort_key)
                 new_props[canonical] = val
                 code_labels[canonical] = repr(code)
             elif isinstance(code, tuple):
-                new_props[int(code[0])] = val
+                new_props[code[0]] = val
             else:
                 new_props[code] = val
         new_targets[temp_name] = new_props
@@ -328,7 +383,7 @@ def _expand_tuple_targets(
 def _fmt_target(
     col: str,
     code: Any,
-    merge_labels: dict[str, tuple[str, dict[int, str]]],
+    merge_labels: dict[str, tuple[str, dict[Any, str]]],
 ) -> tuple[str, str]:
     """Map an (engine column, code) pair back to user-facing display names."""
     if col in merge_labels:
@@ -371,7 +426,7 @@ def _detect_zero_target_on_populated_cell(
 def _format_zero_target_error(
     detected: list[tuple[str, Any, int]],
     context_label: str = "",
-    merge_labels: dict[str, tuple[str, dict[int, str]]] | None = None,
+    merge_labels: dict[str, tuple[str, dict[Any, str]]] | None = None,
 ) -> str:
     """Build the actionable ValueError message for zero_target_policy='error'."""
     merge_labels = merge_labels or {}
@@ -425,7 +480,7 @@ def _apply_zero_target_policy(
     near_zero_eps: float,
     *,
     context_label: str = "",
-    merge_labels: dict[str, tuple[str, dict[int, str]]] | None = None,
+    merge_labels: dict[str, tuple[str, dict[Any, str]]] | None = None,
 ) -> tuple[nw.DataFrame, dict[str, dict[Any, float]], Any]:
     """Apply zero_target_policy. Returns (df_for_engine, modified_targets, keep_mask_or_None).
 
@@ -1179,7 +1234,7 @@ def rake_by_scheme_with_diagnostics(
     # expansion. Schemes sharing the same (column, merge pattern) reuse one
     # temp column; distinct patterns get distinct temp columns, each scheme's
     # rewritten targets referencing its own.
-    merge_labels: dict[str, tuple[str, dict[int, str]]] = {}
+    merge_labels: dict[str, tuple[str, dict[Any, str]]] = {}
     all_temp_cols: list[str] = []
     unique_cache: dict[str, set] = {}
 
@@ -1474,14 +1529,14 @@ def validate_targets(
                     and target_value != 0
                 ):
                     warnings.append(
-                        f"Code {code} in targets for '{col}' not found in data"
+                        f"Code {code!r} in targets for '{col}' not found in data"
                     )
             elif code not in unique_values and target_value != 0:
-                warnings.append(f"Code {code} in targets for '{col}' not found in data")
+                warnings.append(f"Code {code!r} in targets for '{col}' not found in data")
 
         for val in unique_values:
             if val is not None and val not in props and val not in tuple_covered:
-                warnings.append(f"Value {val} in column '{col}' has no target")
+                warnings.append(f"Value {val!r} in column '{col}' has no target")
 
         total = sum(props.values())
         if total > 1.5:
@@ -1578,7 +1633,7 @@ def validate_schemes(
             for val in unique_values:
                 if val is not None and val not in props and val not in tuple_covered:
                     group_warnings.append(
-                        f"Value {val} in column '{col}' has no target"
+                        f"Value {val!r} in column '{col}' has no target"
                     )
 
             total = sum(props.values())

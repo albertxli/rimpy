@@ -1,6 +1,6 @@
 [project]
 name = "rimpy"
-version = "0.3.1"
+version = "0.4.0"
 description = "Super fast rust-powered RIM (raking) survey weighting with narwhals - supports polars and pandas"
 readme = "README.md"
 license = "MIT"
@@ -38,12 +38,17 @@ dependencies = [
 [project.optional-dependencies]
 polars = ["polars>=1.0.0"]
 pandas = ["pandas>=2.0.0", "pyarrow>=14.0.0"]
-all = ["polars>=1.0.0", "pandas>=2.0.0", "pyarrow>=14.0.0"]
+excel = ["fastexcel>=0.12"]
+all = ["polars>=1.0.0", "pandas>=2.0.0", "pyarrow>=14.0.0", "fastexcel>=0.12"]
 dev = [
     "pytest>=9.0.2",
     "pandas>=2.0.0",
     "polars>=1.0.0",
     "pyarrow>=14.0.0",
+    "fastexcel>=0.12",
+    "xlsxwriter>=3.2",
+    "ambers",
+    "marimo",
 ]
 
 [project.urls]

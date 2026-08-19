@@ -29,7 +29,8 @@ uv add rimpy
 
 # With optional dependencies
 pip install rimpy[polars]  # For polars support
-pip install rimpy[all]     # For both polars and pandas
+pip install rimpy[excel]   # To read .xlsx target files
+pip install rimpy[all]     # polars, pandas and Excel support
 ```
 
 Pre-built wheels are available for Linux, Windows, and macOS (arm64) on Python 3.12–3.14. The Rust engine is included automatically — no Rust toolchain needed.
@@ -275,55 +276,101 @@ print(report["_global"]["errors"])
 print(report["US"]["warnings"])
 ```
 
-## Loading Schemes from Files
+## Loading Targets from Files
 
-### `load_schemes(source, **options)`
+### `load_targets(source, **options)`
 
-Load weighting schemes from a **long-format** table.
+Read weighting targets from a spreadsheet or delimited text file into a plain
+dict, ready to hand to any of the rake functions. One row per target category:
 
-```python
-schemes = rim.load_schemes("targets.xlsx")
-weighted = rim.rake_by_scheme(df, schemes, by="country_code")
+| split_var | split_value | split_label | target_var | target_value | target_label | target_pct |
+|-----------|-------------|-------------|------------|--------------|--------------|------------|
+| country   | 101         | Bulgaria    | age        | 1            | 18-34        | 25         |
+| country   | 101         | Bulgaria    | age        | 2            | 35-54        | 35         |
+| country   | 101         | Bulgaria    | age        | 3            | 55+          | 40         |
+| country   | 101         | Bulgaria    | gender     | 1            | Male         | 48.95      |
+| country   | 101         | Bulgaria    | gender     | 2            | Female       | 50.95      |
+| country   | 102         | Croatia     | age        | 1            | 18-34        | 27         |
 
-# Custom column names
-schemes = rim.load_schemes(
-    "targets.xlsx",
-    key_col="country_id",
-    var_col="variable",
-    code_col="code",
-    target_col="pct",
-    sheet_name="Wave1",
-)
-```
-
-Expected input format:
-
-| scheme_key | target_var | target_code | target_pct |
-|------------|------------|-------------|------------|
-| 20230001   | gender     | 1           | 49.85      |
-| 20230001   | gender     | 2           | 49.85      |
-| 20230001   | gender     | 3           | 0.3        |
-| 20230001   | smoker     | 1           | 21         |
-| 20230001   | smoker     | 2           | 79         |
-
-### `load_schemes_wide(source, **options)`
-
-Load weighting schemes from a **wide-format** table.
+Only `split_value`, `target_var`, `target_value` and `target_pct` are read.
+`split_var`, `split_label` and `target_label` are there so whoever fills in the
+sheet can see what the codes mean — they are ignored, as is any other extra
+column.
 
 ```python
-schemes = rim.load_schemes_wide("targets.xlsx")
-weighted = rim.rake_by_scheme(df, schemes, by="country_code")
+# Split file -> nested dict -> rake_by_scheme
+targets = rim.load_targets("weighting_targets.xlsx")
+# {101: {"age": {1: 25.0, 2: 35.0, 3: 40.0}, "gender": {...}}, 102: {...}}
+weighted = rim.rake_by_scheme(df, targets, by="country")
+
+# No split column (or split_col=None) -> flat dict -> rake / rake_by
+targets = rim.load_targets("national_targets.csv")
+# {"age": {1: 25.0, 2: 35.0, 3: 40.0}, "gender": {1: 49.0, 2: 51.0}}
+weighted = rim.rake(df, targets)
+weighted = rim.rake_by(df, targets, by="region")
 ```
 
-Expected input format:
+Options:
 
-| target_var | target_code | 20230001 | 20240001 | 20230002 |
-|------------|-------------|----------|----------|----------|
-| gender     | 1           | 49.85    | 49.9     | 49.9     |
-| gender     | 2           | 49.85    | 49.9     | 49.9     |
-| gender     | 3           | 0.3      | 0.2      | 0.2      |
-| smoker     | 1           | 21       | 9        | 10       |
-| smoker     | 2           | 79       | 91       | 90       |
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `split_col` | `"split_value"` | Split key column. `None` pools every row into one flat dict. |
+| `var_col` | `"target_var"` | Variable name column — must match a DataFrame column name. |
+| `value_col` | `"target_value"` | Category code column. |
+| `pct_col` | `"target_pct"` | Target percentage column. |
+| `combine_col` | `"combine"` | Tag column for combined categories. `None` ignores it. |
+| `sheet_name` | first sheet | Sheet name, or 1-based position, for Excel sources. |
+| `separator` | by extension | Field separator for delimited text (tab for `.tsv`, `,` otherwise). |
+| `validate` | `True` | Warn when a variable sums to neither 100 nor 1. |
+
+Accepts `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.csv`, `.tsv`, `.txt`, or an
+existing polars DataFrame. Reading Excel needs an engine: `pip install rimpy[excel]`.
+
+#### Combined categories
+
+When several categories share one target — because there is no individual
+target per category — tag their rows in a `combine` column. Rows carrying the
+same tag become one combined-category (tuple-key) target:
+
+| split_value | target_var | target_value | target_label | target_pct | combine |
+|-------------|------------|--------------|--------------|------------|---------|
+| 101         | education  | 1            | Low          | 30         | A       |
+| 101         | education  | 2            | Mid          | 30         | A       |
+| 101         | education  | 3            | High         | 45         | B       |
+| 101         | education  | 4            | Top          | 45         | B       |
+| 101         | education  | 5            | Other        | 25         |         |
+
+```python
+targets[101]["education"]
+# {(1, 2): 30.0, (3, 4): 45.0, 5: 25.0}
+```
+
+- The tag is **arbitrary text** — `A`, `x`, `top2`, `1` all work. It only marks
+  which rows belong together; blank means not combined.
+- **Two merges on one variable need two tags.** Rows merge only when they share
+  a tag *and* the same `(split_value, target_var)`, so the same tag under a
+  different variable or split never collides. Reusing one tag for both pairs
+  above would instead produce a single `(1, 2, 3, 4)` cell.
+- The shared percentage may be **repeated on every row** of the group or
+  **entered once with the rest blank**. Two different values raise. The
+  sum-to-100 check counts each cell once: `30 + 45 + 25 = 100`.
+- Tuple members come out **sorted**, so row order never leaks into the key —
+  `(1, 2)` whether the sheet lists 1 first or 2 first. The cells themselves stay
+  in file order.
+
+Notes:
+
+- **Types are preserved as read.** An Int64 `split_value` gives int keys, a
+  String one gives str keys — match whatever the `by` column holds in your data.
+- **Category codes may be integers or text.** Text codes load with a warning,
+  because matching against the DataFrame column is literal — `'Male'` will not
+  match `'male'`, `' Male'` or `1`.
+- **Percentages or proportions both work.** The engine detects which per
+  variable; values are never rescaled at load time.
+- **Order follows the file**, and target order is raking order, so results stay
+  reproducible and under the sheet author's control.
+- Ragged targets are fine: a variable defined for one split only (a
+  country-specific income band, say) is raked for that split alone.
 
 ## Target Formats
 
@@ -345,6 +392,27 @@ targets = [
 
 Values can be proportions (0-1) or percentages (0-100). rimpy auto-detects.
 
+### Category codes: numbers or text
+
+Category codes may be integer codes or the labels themselves:
+
+```python
+targets = {"gender": {"Male": 49, "Female": 51}}   # String / Categorical / Enum column
+targets = {"gender": {1: 49, 2: 51}}               # numeric column
+```
+
+Text codes work on polars `String`, `Categorical` and `Enum` columns and on
+pandas string and `category` columns, in target columns and in `by` columns
+alike. They are coded to integers at the Arrow boundary, so the engine still
+rakes on numbers and results are **bit-identical** to recoding the labels to
+integers by hand.
+
+Matching is literal: `'Male'` does not match `'male'` or `' Male'`, and an
+unknown key raises `ValueError` listing the categories actually present.
+Numeric columns still cost less — at 1M rows × 5 variables, integer codes run
+~146 ms, `Enum` ~174 ms, `Categorical` ~205 ms and plain `String` ~308 ms — so
+recoding to integers is still worth it for very large files.
+
 ### Combined categories (tuple keys)
 
 A tuple key merges categories into **one cell** sharing a single target — the
@@ -363,6 +431,9 @@ This is exactly equivalent to recoding 4/5 into a single code before raking —
 the manual workflow in Q or R's `survey` package — and rimpy produces
 bit-identical weights to that manual pre-merge. Each category may appear in at
 most one target key; overlapping keys raise `ValueError`.
+
+Tuple members may be text as well, on a text column — `{("Low", "Mid"): 50}` —
+but they must not mix labels with numbers, which raises `ValueError`.
 
 ### Unknown target keys raise
 

@@ -26,6 +26,7 @@ use pyo3::types::{PyCapsule, PyDict};
 
 use indexmap::IndexMap;
 
+use arrow_adapter::TargetKey;
 use engine::RakeOpts;
 
 // ---------------------------------------------------------------------------
@@ -180,8 +181,14 @@ impl PyRakeResult {
 // Helper: convert Python target dicts to Rust types
 // ---------------------------------------------------------------------------
 
-/// Convert Python `dict[str, dict[int, float]]` to Rust IndexMap.
-fn extract_targets(targets: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, HashMap<i64, f64>>> {
+/// Convert Python `dict[str, dict[int | str, float]]` to Rust IndexMap.
+///
+/// Codes stay uninterpreted here as `TargetKey`; `arrow_adapter` maps them onto
+/// the data's codes once it has read the column, which is the only place a
+/// string column's dictionary exists.
+fn extract_targets(
+    targets: &Bound<'_, PyDict>,
+) -> PyResult<IndexMap<String, HashMap<TargetKey, f64>>> {
     let mut result = IndexMap::new();
 
     for (col_key, props_obj) in targets.iter() {
@@ -190,9 +197,11 @@ fn extract_targets(targets: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, Has
         let mut code_map = HashMap::new();
 
         for (code_key, val) in props.iter() {
-            let code: i64 = code_key
+            let code = code_key
                 .extract::<i64>()
-                .or_else(|_| code_key.extract::<f64>().map(|f| f as i64))?;
+                .map(TargetKey::Int)
+                .or_else(|_| code_key.extract::<f64>().map(|f| TargetKey::Int(f as i64)))
+                .or_else(|_| code_key.extract::<String>().map(TargetKey::Str))?;
             let target_val: f64 = val.extract()?;
             code_map.insert(code, target_val);
         }
@@ -404,7 +413,8 @@ fn rim_rake_by_scheme(
     };
 
     // Parse per-group schemes
-    let mut parsed_schemes: HashMap<String, IndexMap<String, HashMap<i64, f64>>> = HashMap::new();
+    let mut parsed_schemes: HashMap<String, IndexMap<String, HashMap<TargetKey, f64>>> =
+        HashMap::new();
     for (key, value) in schemes.iter() {
         let group_key: String = key
             .extract::<String>()

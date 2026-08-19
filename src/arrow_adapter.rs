@@ -12,9 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, RecordBatch, StringArray, StringViewArray,
-};
+use arrow::array::{Array, ArrayRef, AsArray, Float64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use indexmap::IndexMap;
 use rayon::prelude::*;
@@ -74,6 +72,194 @@ pub fn extract_i64_column(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64
     }
 }
 
+/// Code assigned to null slots of a string column.
+///
+/// `extract_i64_column` leaves raw buffer contents in null slots, which is only
+/// harmless because `build_valid_mask` drops those rows — and only when
+/// `drop_nulls` is true. With `drop_nulls = false` the code still reaches the
+/// engine, so it must be one no real category can be assigned.
+const NULL_CODE: i64 = i64::MIN;
+
+/// Category label -> integer code for one string-valued column.
+pub type CategoryDict = IndexMap<String, i64>;
+
+/// Per-column category dictionaries; `None` for a numeric column.
+pub type ColumnDicts = HashMap<String, Option<CategoryDict>>;
+
+/// A target-dict key as handed over by a language binding: either an integer
+/// category code, or a category label for a string-valued column.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TargetKey {
+    Int(i64),
+    Str(String),
+}
+
+/// Decode a string-like Arrow array to owned Strings, or `None` if the array
+/// is not string-like.
+///
+/// Handles Utf8, LargeUtf8 and Utf8View, plus a Dictionary over any of them
+/// with any index width (polars Categorical/Enum and pandas category arrive as
+/// `Dictionary(UInt32|UInt8|Int8, LargeUtf8|Utf8View)`, so the index type
+/// cannot be matched on directly). Everything is cast to LargeUtf8 first so
+/// there is a single read path.
+fn as_large_utf8(array: &ArrayRef) -> Option<ArrayRef> {
+    fn is_stringy(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    }
+
+    let stringy = match array.data_type() {
+        dt if is_stringy(dt) => true,
+        DataType::Dictionary(_, value_type) => is_stringy(value_type),
+        _ => false,
+    };
+    if !stringy {
+        return None;
+    }
+    arrow::compute::cast(array, &DataType::LargeUtf8).ok()
+}
+
+fn decode_string_column(array: &ArrayRef) -> Option<Vec<Option<String>>> {
+    let large = as_large_utf8(array)?;
+    let arr = large.as_string::<i64>();
+    Some(
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Extract a target column as integer codes, plus the string dictionary when
+/// the column held categories as text.
+///
+/// Numeric columns behave exactly as before and carry no dictionary. String
+/// columns get codes assigned in first-appearance order; the same dictionary
+/// must then map that column's target keys (see `resolve_target_keys`), which
+/// makes the whole thing equivalent to the caller having recoded the strings to
+/// integers by hand. `engine.rs` never sees a string either way.
+pub fn extract_codes_column(
+    batch: &RecordBatch,
+    col_name: &str,
+) -> Result<(Vec<i64>, Option<CategoryDict>), String> {
+    let col_idx = batch
+        .schema()
+        .index_of(col_name)
+        .map_err(|_| format!("Column '{col_name}' not found in Arrow data"))?;
+
+    let array = batch.column(col_idx);
+
+    // Dictionary columns (polars Categorical/Enum, pandas category) are already
+    // encoded: walk the indices and touch each distinct label once, instead of
+    // materializing one string per row via a cast.
+    if matches!(array.data_type(), DataType::Dictionary(_, _))
+        && let Some(values) = as_large_utf8(array.as_any_dictionary().values())
+    {
+        let dictionary = array.as_any_dictionary();
+        let values = values.as_string::<i64>();
+        let keys = dictionary.normalized_keys();
+        let nulls = array.logical_nulls();
+
+        let mut slot_code: Vec<i64> = vec![-1; values.len()];
+        let mut dict = CategoryDict::new();
+        let codes = (0..array.len())
+            .map(|i| {
+                if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+                    return NULL_CODE;
+                }
+                let slot = keys[i];
+                if values.is_null(slot) {
+                    return NULL_CODE;
+                }
+                if slot_code[slot] < 0 {
+                    let code = dict.len() as i64;
+                    dict.insert(values.value(slot).to_string(), code);
+                    slot_code[slot] = code;
+                }
+                slot_code[slot]
+            })
+            .collect();
+        return Ok((codes, Some(dict)));
+    }
+
+    if let Some(large) = as_large_utf8(array) {
+        // Look up borrowed &str and only allocate when a category is new, so
+        // this stays one allocation per distinct category rather than per row.
+        let arr = large.as_string::<i64>();
+        let mut dict = CategoryDict::new();
+        let codes = (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    return NULL_CODE;
+                }
+                let label = arr.value(i);
+                match dict.get(label) {
+                    Some(&code) => code,
+                    None => {
+                        let code = dict.len() as i64;
+                        dict.insert(label.to_string(), code);
+                        code
+                    }
+                }
+            })
+            .collect();
+        return Ok((codes, Some(dict)));
+    }
+
+    Ok((extract_i64_column(batch, col_name)?, None))
+}
+
+/// Map one column's target keys onto the codes used for its data.
+pub fn resolve_target_keys(
+    col: &str,
+    keys: &HashMap<TargetKey, f64>,
+    dict: Option<&CategoryDict>,
+) -> Result<HashMap<i64, f64>, String> {
+    let mut out = HashMap::with_capacity(keys.len());
+    for (key, &value) in keys {
+        let code = match (key, dict) {
+            (TargetKey::Int(code), None) => *code,
+            (TargetKey::Str(label), Some(d)) => *d.get(label.as_str()).ok_or_else(|| {
+                format!("Target key {label:?} for column '{col}' is not a category in the data")
+            })?,
+            (TargetKey::Str(label), None) => {
+                return Err(format!(
+                    "Target key {label:?} for column '{col}' is text, but that column \
+                     holds numeric category codes"
+                ));
+            }
+            (TargetKey::Int(code), Some(_)) => {
+                return Err(format!(
+                    "Target key {code} for column '{col}' is numeric, but that column \
+                     holds text category codes"
+                ));
+            }
+        };
+        out.insert(code, value);
+    }
+    Ok(out)
+}
+
+/// Map a whole target set onto data codes, preserving column order.
+pub fn resolve_targets(
+    targets: &IndexMap<String, HashMap<TargetKey, f64>>,
+    dicts: &ColumnDicts,
+) -> Result<IndexMap<String, HashMap<i64, f64>>, String> {
+    let mut out = IndexMap::with_capacity(targets.len());
+    for (col, keys) in targets {
+        let dict = dicts.get(col).and_then(|d| d.as_ref());
+        out.insert(col.clone(), resolve_target_keys(col, keys, dict)?);
+    }
+    Ok(out)
+}
+
 /// Build a null/valid mask from Arrow null bitmaps for the given columns.
 /// Returns a boolean vec: `true` = valid (no nulls in any target column).
 pub fn build_valid_mask(
@@ -119,8 +305,9 @@ pub fn append_weight_column(
 }
 
 /// Extract a group column as String keys.
-/// Handles Utf8, LargeUtf8, Utf8View, Int64, Int32, Float64.
-/// Null values become `"__null__"`.
+/// Handles any string-like type (Utf8, LargeUtf8, Utf8View, or a Dictionary
+/// over them — i.e. polars Categorical/Enum and pandas category), plus Int64,
+/// Int32 and Float64. Null values become `"__null__"`.
 pub fn extract_group_keys(batch: &RecordBatch, group_col: &str) -> Result<Vec<String>, String> {
     let col_idx = batch
         .schema()
@@ -128,46 +315,14 @@ pub fn extract_group_keys(batch: &RecordBatch, group_col: &str) -> Result<Vec<St
         .map_err(|_| format!("Group column '{group_col}' not found"))?;
     let array = batch.column(col_idx);
 
+    if let Some(values) = decode_string_column(array) {
+        return Ok(values
+            .into_iter()
+            .map(|v| v.unwrap_or_else(|| "__null__".to_string()))
+            .collect());
+    }
+
     match array.data_type() {
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            Ok((0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        "__null__".to_string()
-                    } else {
-                        arr.value(i).to_string()
-                    }
-                })
-                .collect())
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-                .unwrap();
-            Ok((0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        "__null__".to_string()
-                    } else {
-                        arr.value(i).to_string()
-                    }
-                })
-                .collect())
-        }
-        DataType::Utf8View => {
-            let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
-            Ok((0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        "__null__".to_string()
-                    } else {
-                        arr.value(i).to_string()
-                    }
-                })
-                .collect())
-        }
         DataType::Int64 => {
             let arr = array.as_primitive::<Int64Type>();
             Ok((0..arr.len())
@@ -217,18 +372,22 @@ pub fn extract_group_keys(batch: &RecordBatch, group_col: &str) -> Result<Vec<St
 pub fn rake_on_batch(
     batch: &RecordBatch,
     target_columns: &[String],
-    targets: &IndexMap<String, HashMap<i64, f64>>,
+    targets: &IndexMap<String, HashMap<TargetKey, f64>>,
     opts: &RakeOpts,
     drop_nulls: bool,
     total: Option<f64>,
 ) -> Result<(Vec<f64>, usize, RakeResult), String> {
     let n_rows = batch.num_rows();
 
-    // Extract all target columns
+    // Extract all target columns, keeping any string dictionary alongside
     let mut columns: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut dicts = ColumnDicts::new();
     for col_name in target_columns {
-        columns.insert(col_name.clone(), extract_i64_column(batch, col_name)?);
+        let (codes, dict) = extract_codes_column(batch, col_name)?;
+        columns.insert(col_name.clone(), codes);
+        dicts.insert(col_name.clone(), dict);
     }
+    let targets = &resolve_targets(targets, &dicts)?;
 
     // Build valid mask from Arrow null bitmaps
     let valid_mask = if drop_nulls {
@@ -333,7 +492,7 @@ pub struct GroupRakeResult {
 pub fn rake_batch(
     batch: &RecordBatch,
     target_columns: &[String],
-    targets: &IndexMap<String, HashMap<i64, f64>>,
+    targets: &IndexMap<String, HashMap<TargetKey, f64>>,
     weight_column: &str,
     opts: &RakeOpts,
     drop_nulls: bool,
@@ -353,7 +512,7 @@ pub fn rake_batch(
 pub fn rake_batch_grouped(
     batch: &RecordBatch,
     target_columns: &[String],
-    targets: &IndexMap<String, HashMap<i64, f64>>,
+    targets: &IndexMap<String, HashMap<TargetKey, f64>>,
     group_columns: &[String],
     weight_column: &str,
     opts: &RakeOpts,
@@ -368,11 +527,16 @@ pub fn rake_batch_grouped(
     // Partition rows by group
     let group_row_indices = partition_by_group(&group_keys);
 
-    // Extract all target columns once
+    // Extract all target columns once, over the whole batch: a string column's
+    // dictionary must be shared by every group or codes would disagree.
     let mut all_columns: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut dicts = ColumnDicts::new();
     for col_name in target_columns {
-        all_columns.insert(col_name.clone(), extract_i64_column(batch, col_name)?);
+        let (codes, dict) = extract_codes_column(batch, col_name)?;
+        all_columns.insert(col_name.clone(), codes);
+        dicts.insert(col_name.clone(), dict);
     }
+    let targets = &resolve_targets(targets, &dicts)?;
 
     // Build valid mask
     let valid_mask = if drop_nulls {
@@ -448,8 +612,8 @@ pub fn rake_batch_grouped(
 pub fn rake_batch_by_scheme(
     batch: &RecordBatch,
     group_column: &str,
-    schemes: &HashMap<String, IndexMap<String, HashMap<i64, f64>>>,
-    default_scheme: Option<&IndexMap<String, HashMap<i64, f64>>>,
+    schemes: &HashMap<String, IndexMap<String, HashMap<TargetKey, f64>>>,
+    default_scheme: Option<&IndexMap<String, HashMap<TargetKey, f64>>>,
     weight_column: &str,
     opts: &RakeOpts,
     drop_nulls: bool,
@@ -477,13 +641,28 @@ pub fn rake_batch_by_scheme(
         }
     }
 
-    // Extract all needed columns once
+    // Extract all needed columns once, over the whole batch, so every scheme
+    // referencing the same string column shares one code space.
     let mut all_columns: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut dicts = ColumnDicts::new();
     for col_name in &all_target_cols {
         if batch.schema().index_of(col_name).is_ok() {
-            all_columns.insert(col_name.clone(), extract_i64_column(batch, col_name)?);
+            let (codes, dict) = extract_codes_column(batch, col_name)?;
+            all_columns.insert(col_name.clone(), codes);
+            dicts.insert(col_name.clone(), dict);
         }
     }
+
+    // Resolve every scheme against those shared dictionaries up front.
+    let schemes: HashMap<String, IndexMap<String, HashMap<i64, f64>>> = schemes
+        .iter()
+        .map(|(k, t)| Ok((k.clone(), resolve_targets(t, &dicts)?)))
+        .collect::<Result<_, String>>()?;
+    let default_scheme = match default_scheme {
+        Some(dt) => Some(resolve_targets(dt, &dicts)?),
+        None => None,
+    };
+    let default_scheme = default_scheme.as_ref();
 
     // Build valid mask (across ALL target columns that exist)
     let existing_target_cols: Vec<String> = all_target_cols
@@ -689,4 +868,215 @@ fn rake_group(
 
     let result = engine::rim_iterate(&col_refs, targets, opts)?;
     Ok((valid_indices, result))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        DictionaryArray, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    };
+    use arrow::datatypes::{Int8Type, UInt8Type, UInt32Type};
+
+    fn batch(name: &str, array: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            array.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn abc() -> Vec<Option<String>> {
+        vec![Some("a".to_string()), None, Some("b".to_string())]
+    }
+
+    #[test]
+    fn decodes_every_string_layout() {
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None, Some("b")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("a"), None, Some("b")]));
+        for array in [utf8, large, view] {
+            assert_eq!(decode_string_column(&array), Some(abc()));
+        }
+    }
+
+    #[test]
+    fn decodes_dictionaries_of_any_index_width() {
+        // polars Categorical arrives as UInt32, Enum as UInt8, pandas category
+        // as Int8 — the index type cannot be matched on directly.
+        let d32: ArrayRef = Arc::new(
+            vec![Some("a"), None, Some("b")]
+                .into_iter()
+                .collect::<DictionaryArray<UInt32Type>>(),
+        );
+        let d8: ArrayRef = Arc::new(
+            vec![Some("a"), None, Some("b")]
+                .into_iter()
+                .collect::<DictionaryArray<UInt8Type>>(),
+        );
+        let di8: ArrayRef = Arc::new(
+            vec![Some("a"), None, Some("b")]
+                .into_iter()
+                .collect::<DictionaryArray<Int8Type>>(),
+        );
+        for array in [d32, d8, di8] {
+            assert_eq!(decode_string_column(&array), Some(abc()));
+        }
+    }
+
+    #[test]
+    fn numeric_arrays_are_not_string_like() {
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        assert_eq!(decode_string_column(&array), None);
+    }
+
+    #[test]
+    fn numeric_column_extracts_without_a_dictionary() {
+        let b = batch("c", Arc::new(Int64Array::from(vec![1, 2, 3])));
+        let (codes, dict) = extract_codes_column(&b, "c").unwrap();
+        assert_eq!(codes, vec![1, 2, 3]);
+        assert!(dict.is_none());
+    }
+
+    #[test]
+    fn string_column_codes_in_first_appearance_order() {
+        let b = batch(
+            "c",
+            Arc::new(StringArray::from(vec![
+                Some("b"),
+                Some("a"),
+                Some("b"),
+                None,
+            ])),
+        );
+        let (codes, dict) = extract_codes_column(&b, "c").unwrap();
+        let dict = dict.expect("string column must carry a dictionary");
+        assert_eq!(dict["b"], 0);
+        assert_eq!(dict["a"], 1);
+        assert_eq!(codes, vec![0, 1, 0, NULL_CODE]);
+    }
+
+    #[test]
+    fn null_code_never_collides_with_a_real_category() {
+        let labels: Vec<String> = (0..500).map(|i| format!("cat{i}")).collect();
+        let array: ArrayRef = Arc::new(StringArray::from(
+            labels.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+        ));
+        let b = batch("c", array);
+        let (codes, dict) = extract_codes_column(&b, "c").unwrap();
+        assert!(dict.unwrap().values().all(|&c| c != NULL_CODE));
+        assert!(codes.iter().all(|&c| c != NULL_CODE));
+    }
+
+    #[test]
+    fn dictionary_column_round_trips_through_extract() {
+        let array: ArrayRef = Arc::new(
+            vec![Some("x"), Some("y"), Some("x")]
+                .into_iter()
+                .collect::<DictionaryArray<UInt32Type>>(),
+        );
+        let (codes, dict) = extract_codes_column(&batch("c", array), "c").unwrap();
+        assert_eq!(codes, vec![0, 1, 0]);
+        assert_eq!(dict.unwrap().len(), 2);
+    }
+
+    fn mf_dict() -> CategoryDict {
+        let mut dict = CategoryDict::new();
+        dict.insert("M".to_string(), 0);
+        dict.insert("F".to_string(), 1);
+        dict
+    }
+
+    #[test]
+    fn resolves_labels_through_the_dictionary() {
+        let mut keys = HashMap::new();
+        keys.insert(TargetKey::Str("M".to_string()), 40.0);
+        keys.insert(TargetKey::Str("F".to_string()), 60.0);
+
+        let resolved = resolve_target_keys("g", &keys, Some(&mf_dict())).unwrap();
+        assert_eq!(resolved[&0], 40.0);
+        assert_eq!(resolved[&1], 60.0);
+    }
+
+    #[test]
+    fn resolves_integers_for_numeric_columns() {
+        let mut keys = HashMap::new();
+        keys.insert(TargetKey::Int(7), 100.0);
+        let resolved = resolve_target_keys("g", &keys, None).unwrap();
+        assert_eq!(resolved[&7], 100.0);
+    }
+
+    #[test]
+    fn unknown_label_is_rejected() {
+        let mut keys = HashMap::new();
+        keys.insert(TargetKey::Str("X".to_string()), 100.0);
+        let err = resolve_target_keys("g", &keys, Some(&mf_dict())).unwrap_err();
+        assert!(err.contains("not a category"), "{err}");
+    }
+
+    #[test]
+    fn key_type_mismatches_are_rejected() {
+        let mut label = HashMap::new();
+        label.insert(TargetKey::Str("M".to_string()), 100.0);
+        let err = resolve_target_keys("g", &label, None).unwrap_err();
+        assert!(err.contains("holds numeric category codes"), "{err}");
+
+        let mut number = HashMap::new();
+        number.insert(TargetKey::Int(1), 100.0);
+        let err = resolve_target_keys("g", &number, Some(&mf_dict())).unwrap_err();
+        assert!(err.contains("holds text category codes"), "{err}");
+    }
+
+    #[test]
+    fn resolve_targets_preserves_column_order() {
+        let mut targets: IndexMap<String, HashMap<TargetKey, f64>> = IndexMap::new();
+        for col in ["z", "a", "m"] {
+            let mut keys = HashMap::new();
+            keys.insert(TargetKey::Int(1), 100.0);
+            targets.insert(col.to_string(), keys);
+        }
+        let resolved = resolve_targets(&targets, &ColumnDicts::new()).unwrap();
+        assert_eq!(resolved.keys().collect::<Vec<_>>(), ["z", "a", "m"]);
+    }
+
+    #[test]
+    fn group_keys_accept_dictionary_columns() {
+        // polars Categorical / pandas category `by` columns used to fail with
+        // "Unsupported group column type".
+        let array: ArrayRef = Arc::new(
+            vec![Some("US"), None, Some("UK")]
+                .into_iter()
+                .collect::<DictionaryArray<UInt32Type>>(),
+        );
+        let keys = extract_group_keys(&batch("country", array), "country").unwrap();
+        assert_eq!(keys, vec!["US", "__null__", "UK"]);
+    }
+
+    #[test]
+    fn group_keys_still_accept_plain_strings_and_numbers() {
+        let s: ArrayRef = Arc::new(StringArray::from(vec![Some("US"), None]));
+        assert_eq!(
+            extract_group_keys(&batch("g", s), "g").unwrap(),
+            vec!["US", "__null__"]
+        );
+
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![101, 102]));
+        assert_eq!(
+            extract_group_keys(&batch("g", i), "g").unwrap(),
+            vec!["101", "102"]
+        );
+    }
+
+    #[test]
+    fn valid_mask_handles_string_columns() {
+        let array: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+        let b = batch("c", array);
+        let mask = build_valid_mask(&b, &["c".to_string()]).unwrap();
+        assert_eq!(mask, vec![true, false, true]);
+    }
 }
