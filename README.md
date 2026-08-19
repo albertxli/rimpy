@@ -406,6 +406,22 @@ if not result.converged:
 If contradictory targets are suspected, `validate_targets` / `validate_schemes`
 report every problem across all schemes at once without raising.
 
+### Upgrading from 0.4.x
+
+**`convergence_threshold` changed units in 0.5.0.** It used to be the summed
+weight movement across all rows; it is now the maximum relative margin error.
+A value carried over from an older call means something different now, and
+usually something looser:
+
+| old call | old meaning (n=200) | same number in 0.5.0 | what to do |
+|----------|--------------------|----------------------|------------|
+| `0.01` (the old default) | ~5e-5 per weight | very loose | delete the argument |
+| `1e-6` (a hand-tuned value) | ~5e-9 per weight | looser than the 1e-8 default | delete the argument |
+
+The new default is tighter than anything most 0.4.x callers were passing, so
+**the fix is almost always to remove the argument**. Pass one only to go
+tighter than 1e-8.
+
 ## Target Formats
 
 rimpy accepts targets in two formats:
