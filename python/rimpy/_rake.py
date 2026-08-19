@@ -308,6 +308,41 @@ def _validate_target_keys(
     return absent_members, absent_zero
 
 
+def _warn_on_non_convergence(
+    diagnostics: Any,
+    *,
+    group_key: Any = None,
+    stacklevel: int,
+) -> None:
+    """Warn when raking finished without meeting the targets.
+
+    Raking cannot satisfy target sets that contradict each other — a property
+    of the algorithm, not of this implementation — and it cannot satisfy
+    targets that weight caps forbid. Either way the caller gets weights back,
+    so silence would read as success. R survey warns ("Failed to converge:
+    eps=...") and attaches the achieved epsilon; anesrake and autumn warn too.
+    This is rimpy's equivalent.
+    """
+    if diagnostics.converged:
+        return
+
+    where = f"Group {group_key!r}: " if group_key is not None else ""
+    reason = (
+        "stopped improving before the targets were met (usually means the "
+        "targets contradict each other, or weight caps make them unreachable)"
+        if diagnostics.stalled
+        else f"hit max_iterations ({diagnostics.iterations})"
+    )
+    warnings.warn(
+        f"{where}Raking did not converge: {reason}. Worst margin is off target "
+        f"by {diagnostics.max_target_gap * 100:.4g}% (relative). Weights were "
+        f"still returned. Check the targets against the data, or raise "
+        f"max_iterations.",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+
+
 def _warn_on_empty_groups(
     group_diags: dict[Any, Any],
     columns: Any,
@@ -631,7 +666,7 @@ def rake(
     targets: dict[str, dict[Any, float]] | list[dict[str, dict[Any, float]]],
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -664,7 +699,11 @@ def rake(
     max_iterations
         Maximum iterations before stopping.
     convergence_threshold
-        Convergence criterion (lower = stricter).
+        Maximum relative margin error to accept, i.e. how far a weighted
+        category share may sit from its target: 1e-8 means every margin lands
+        within 0.000001% of target. Lower is stricter. Because it measures the
+        margins rather than how far weights moved, it means the same thing on a
+        200-row subgroup as on a million rows.
     min_cap
         Minimum allowed weight (optional).
     max_cap
@@ -756,7 +795,7 @@ def rake_with_diagnostics(
     targets: dict[str, dict[Any, float]] | list[dict[str, dict[Any, float]]],
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -902,6 +941,8 @@ def rake_with_diagnostics(
     if temp_cols:
         result_df = result_df.drop(*[c for c in temp_cols if c in result_df.columns])
 
+    _warn_on_non_convergence(diagnostics, stacklevel=_warning_stacklevel)
+
     return nw.to_native(result_df), diagnostics
 
 
@@ -911,7 +952,7 @@ def rake_by(
     by: str | list[str],
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -993,7 +1034,7 @@ def rake_by_with_diagnostics(
     by: str | list[str],
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -1144,6 +1185,8 @@ def rake_by_with_diagnostics(
     _warn_on_empty_groups(
         group_diags_dict, target_col_names, stacklevel=_warning_stacklevel
     )
+    for _gk, _gr in group_diags_dict.items():
+        _warn_on_non_convergence(_gr, group_key=_gk, stacklevel=_warning_stacklevel)
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,
@@ -1166,6 +1209,8 @@ class GroupedRakeResult:
             "n_valid": [],
             "iterations": [],
             "converged": [],
+            "stalled": [],
+            "max_target_gap": [],
             "efficiency": [],
             "weight_min": [],
             "weight_max": [],
@@ -1176,6 +1221,8 @@ class GroupedRakeResult:
             rows["n_valid"].append(result.n_valid)
             rows["iterations"].append(result.iterations)
             rows["converged"].append(result.converged)
+            rows["stalled"].append(result.stalled)
+            rows["max_target_gap"].append(result.max_target_gap)
             rows["efficiency"].append(round(result.efficiency, 2))
             rows["weight_min"].append(round(result.weight_min, 4))
             rows["weight_max"].append(round(result.weight_max, 4))
@@ -1189,7 +1236,7 @@ def rake_by_scheme(
     by: str,
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -1285,7 +1332,7 @@ def rake_by_scheme_with_diagnostics(
     by: str,
     *,
     max_iterations: int = 1000,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 1e-8,
     min_cap: float | None = None,
     max_cap: float | None = None,
     weight_column: str = "weight",
@@ -1536,6 +1583,8 @@ def rake_by_scheme_with_diagnostics(
         sorted({c for sch in normalized_schemes.values() for c in sch}),
         stacklevel=_warning_stacklevel,
     )
+    for _gk, _gr in group_diags_dict.items():
+        _warn_on_non_convergence(_gr, group_key=_gk, stacklevel=_warning_stacklevel)
 
     grouped_result = GroupedRakeResult(
         group_results=group_diags_dict,

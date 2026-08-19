@@ -8,6 +8,7 @@ CSV is used for most cases so no Excel engine is required; the xlsx round-trip
 is gated on fastexcel/xlsxwriter being installed.
 """
 
+import random
 import warnings
 
 import polars as pl
@@ -377,24 +378,35 @@ country,101,Bulgaria,gender,2,Female,0.51"""
 
 
 def make_survey_df():
-    """100 rows across two countries, deliberately skewed away from targets."""
+    """Two countries, deliberately skewed away from targets.
+
+    Variables are drawn independently from a fixed seed. That matters: cycling
+    two of them on periods that share a factor makes them perfectly correlated,
+    and their targets then contradict each other, so no weight vector satisfies
+    both and raking legitimately fails to converge.
+
+    Country 101 is sized like the real workbook (400 respondents, 2 of them
+    gender 3) because the scheme targets gender 3 at 0.1% — on a 60-row group
+    that would be 0.06 weighted people against 2 real respondents.
+    """
+    rng = random.Random(1234)
     rows = []
-    for i in range(60):
+    for i in range(400):
         rows.append(
             {
                 "country": 101,
-                "age": (i % 3) + 1,
-                "gender": 3 if i < 2 else (i % 2) + 1,
-                "income_bg": (i % 2) + 1,
+                "age": rng.choice([1, 1, 2, 3]),
+                "gender": 3 if i < 2 else rng.choice([1, 2]),
+                "income_bg": rng.choice([1, 2]),
             }
         )
-    for i in range(42):
+    for i in range(200):
         rows.append(
             {
                 "country": 102,
-                "age": 1 if i < 30 else (i % 2) + 2,
-                "gender": (i % 2) + 1,
-                "income_bg": (i % 2) + 1,
+                "age": rng.choice([1, 1, 2, 3]),
+                "gender": rng.choice([1, 2]),
+                "income_bg": rng.choice([1, 2]),
             }
         )
     return pl.DataFrame(rows)

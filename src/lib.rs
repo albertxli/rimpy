@@ -122,6 +122,10 @@ struct PyRakeResult {
     #[pyo3(get)]
     converged: bool,
     #[pyo3(get)]
+    stalled: bool,
+    #[pyo3(get)]
+    max_target_gap: f64,
+    #[pyo3(get)]
     efficiency: f64,
     #[pyo3(get)]
     weight_min: f64,
@@ -145,6 +149,8 @@ impl PyRakeResult {
         m.insert("n_valid".into(), self.n_valid as f64);
         m.insert("iterations".into(), self.iterations as f64);
         m.insert("converged".into(), if self.converged { 1.0 } else { 0.0 });
+        m.insert("stalled".into(), if self.stalled { 1.0 } else { 0.0 });
+        m.insert("max_target_gap".into(), self.max_target_gap);
         m.insert(
             "efficiency".into(),
             (self.efficiency * 100.0).round() / 100.0,
@@ -166,10 +172,11 @@ impl PyRakeResult {
 
     fn __repr__(&self) -> String {
         format!(
-            "RakeResult(n_valid={}, iterations={}, converged={}, efficiency={:.2}%, weights=[{:.4}..{:.4}])",
+            "RakeResult(n_valid={}, iterations={}, converged={}, max_target_gap={:.2e}, efficiency={:.2}%, weights=[{:.4}..{:.4}])",
             self.n_valid,
             self.iterations,
             self.converged,
+            self.max_target_gap,
             self.efficiency,
             self.weight_min,
             self.weight_max,
@@ -274,6 +281,8 @@ fn rim_rake(
             n_valid,
             iterations: result.iterations,
             converged: result.converged,
+            stalled: result.stalled,
+            max_target_gap: result.max_target_gap,
             efficiency: result.efficiency,
             weight_min: result.weight_min,
             weight_max: result.weight_max,
@@ -345,6 +354,8 @@ fn rim_rake_grouped(
             n_valid: gr.n_valid,
             iterations: gr.result.iterations,
             converged: gr.result.converged,
+            stalled: gr.result.stalled,
+            max_target_gap: gr.result.max_target_gap,
             efficiency: gr.result.efficiency,
             weight_min: gr.result.weight_min,
             weight_max: gr.result.weight_max,
@@ -461,6 +472,8 @@ fn rim_rake_by_scheme(
             n_valid: gr.n_valid,
             iterations: gr.result.iterations,
             converged: gr.result.converged,
+            stalled: gr.result.stalled,
+            max_target_gap: gr.result.max_target_gap,
             efficiency: gr.result.efficiency,
             weight_min: gr.result.weight_min,
             weight_max: gr.result.weight_max,

@@ -108,7 +108,7 @@ weighted = rim.rake(
     df,                          # polars or pandas DataFrame
     targets,                     # dict of target proportions
     max_iterations=1000,         # max iterations before stopping
-    convergence_threshold=0.01,  # convergence criterion
+    convergence_threshold=1e-8,  # max relative margin error to accept
     min_cap=None,                # minimum weight (optional)
     max_cap=None,                # maximum weight (optional)
     weight_column="weight",      # name for weight column
@@ -137,8 +137,10 @@ Same as `rake()` but also returns diagnostics.
 ```python
 weighted, result = rim.rake_with_diagnostics(df, targets)
 
-print(result.converged)      # True/False
-print(result.iterations)     # Number of iterations
+print(result.converged)       # True only if every margin was met
+print(result.iterations)      # Number of iterations
+print(result.stalled)         # True if it stopped improving before that
+print(result.max_target_gap)  # How far the worst margin still is from target
 print(result.efficiency)     # Weighting efficiency (0-100%)
 print(result.weight_min)     # Minimum weight
 print(result.weight_max)     # Maximum weight
@@ -371,6 +373,38 @@ Notes:
   reproducible and under the sheet author's control.
 - Ragged targets are fine: a variable defined for one split only (a
   country-specific income band, say) is raked for that split alone.
+
+## Convergence
+
+rimpy stops when every weighted margin sits within `convergence_threshold` of
+its target, measured as `|achieved - target| / (1 + target)` — the regularized
+relative error R's `survey::calibrate` uses. The `+ 1` keeps the measure
+meaningful for near-zero targets, where a plain relative error would read as
+100% no matter how small the absolute miss.
+
+Two consequences worth knowing:
+
+- **The tolerance means the same thing at any sample size.** It is a property of
+  the margins, not of how far weights moved, so a 200-respondent subgroup is
+  held to the same standard as a million rows. (Before v0.5.0 the criterion
+  summed weight movement across rows, which made the same default hundreds of
+  times looser on small groups.)
+- **Targets that cannot be met do not report success.** Raking cannot satisfy
+  target sets that contradict each other — a property of the algorithm, not of
+  this implementation — and weight caps can put targets out of reach. In either
+  case `converged` is `False`, `stalled` says whether it gave up early or ran
+  out of iterations, `max_target_gap` carries the achieved error, and a
+  `UserWarning` is raised. Weights are still returned, exactly as R's
+  `survey::rake` warns and returns.
+
+```python
+weighted, result = rim.rake_with_diagnostics(df, targets)
+if not result.converged:
+    print(f"worst margin off by {result.max_target_gap:.2%}")
+```
+
+If contradictory targets are suspected, `validate_targets` / `validate_schemes`
+report every problem across all schemes at once without raising.
 
 ## Target Formats
 

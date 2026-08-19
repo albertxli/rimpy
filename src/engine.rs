@@ -12,7 +12,14 @@ use std::collections::HashMap;
 pub struct RakeResult {
     pub weights: Vec<f64>,
     pub iterations: usize,
+    /// True only when every margin was met to within `convergence_threshold`.
     pub converged: bool,
+    /// True when iteration stopped because progress plateaued without the
+    /// margins being met — the signature of mutually contradictory targets.
+    pub stalled: bool,
+    /// Achieved max relative margin error, `max |achieved/target - 1|`, measured
+    /// on the returned weights. The equivalent of R survey's `attr(g, "failed")`.
+    pub max_target_gap: f64,
     pub efficiency: f64,
     pub weight_min: f64,
     pub weight_max: f64,
@@ -43,13 +50,23 @@ impl Default for RakeOpts {
     fn default() -> Self {
         Self {
             max_iterations: 1000,
-            convergence_threshold: 0.01,
+            // Max relative margin error, not weight movement. See rim_iterate.
+            convergence_threshold: 1e-8,
             min_cap: None,
             max_cap: None,
             cap_correction: true,
         }
     }
 }
+
+/// Relative improvement in max misfit below which an iteration counts as
+/// making no progress. Independent of `convergence_threshold`: conflating the
+/// two is what let a stall masquerade as convergence (see rim_iterate).
+const STALL_TOLERANCE: f64 = 1e-10;
+
+/// Consecutive no-progress iterations before giving up. More than one, so a
+/// single flat iteration during a slow phase does not end the run early.
+const STALL_ROUNDS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Index cache: built once per variable, reused across all iterations
@@ -83,12 +100,22 @@ pub fn build_index_cache(column: &[i64], codes: &[i64]) -> IndexCache {
 ///
 /// Operates entirely in-place — zero allocations.
 #[inline]
+/// Rake one variable, returning the largest margin error it had to correct.
+///
+/// Misfit is `|achieved - target| / (1 + target)` in weighted-count units, the
+/// same regularized form R survey's calibrate uses. The `+ 1` matters: a plain
+/// relative error is meaningless for a near-zero target (as `zero_target_policy
+/// = "near_zero"` deliberately creates), where a vanishing absolute error still
+/// reads as ~100% relative and convergence could never be declared. Both terms
+/// are already in hand, so this costs nothing but the max.
 fn rake_on_variable(
     weights: &mut [f64],
     index_cache: &IndexCache,
     target_props: &HashMap<i64, f64>,
     n: f64,
-) {
+) -> f64 {
+    let mut max_misfit = 0.0_f64;
+
     for (&code, &target_prop) in target_props {
         if let Some(indices) = index_cache.get(&code) {
             if indices.is_empty() {
@@ -104,6 +131,8 @@ fn rake_on_variable(
             let current_sum: f64 = indices.iter().map(|&i| weights[i]).sum();
 
             if current_sum > 0.0 {
+                max_misfit =
+                    max_misfit.max((current_sum - target_count).abs() / (1.0 + target_count));
                 let multiplier = target_count / current_sum;
 
                 // Scatter-multiply: update weights at indices
@@ -113,6 +142,46 @@ fn rake_on_variable(
             }
         }
     }
+
+    max_misfit
+}
+
+/// Max margin error of a weight vector, in the same regularized units
+/// `rake_on_variable` reports: `max |achieved - target| / (1 + target)`.
+///
+/// Run once on the final weights, after caps, so the reported gap describes the
+/// weights actually returned rather than a mid-sweep estimate. Using the same
+/// formula as the loop keeps `converged == (max_target_gap < threshold)` true.
+fn measure_target_gap(
+    weights: &[f64],
+    index_caches: &HashMap<String, IndexCache>,
+    normalized: &IndexMap<String, Cow<'_, HashMap<i64, f64>>>,
+    n: f64,
+) -> f64 {
+    let mut worst = 0.0_f64;
+
+    for (col, props) in normalized {
+        let Some(cache) = index_caches.get(col) else {
+            continue;
+        };
+        let props: &HashMap<i64, f64> = props.as_ref();
+        for (&code, &target_prop) in props {
+            let Some(indices) = cache.get(&code) else {
+                continue;
+            };
+            if indices.is_empty() {
+                continue;
+            }
+            let target_count = target_prop * n;
+            if target_count < 1e-10 {
+                continue;
+            }
+            let achieved: f64 = indices.iter().map(|&i| weights[i]).sum();
+            worst = worst.max((achieved - target_count).abs() / (1.0 + target_count));
+        }
+    }
+
+    worst
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +306,8 @@ pub fn rim_iterate(
                 weights: vec![],
                 iterations: 0,
                 converged: true,
+                stalled: false,
+                max_target_gap: 0.0,
                 efficiency: 100.0,
                 weight_min: 1.0,
                 weight_max: 1.0,
@@ -249,6 +320,8 @@ pub fn rim_iterate(
             weights: vec![],
             iterations: 0,
             converged: true,
+            stalled: false,
+            max_target_gap: 0.0,
             efficiency: 100.0,
             weight_min: 1.0,
             weight_max: 1.0,
@@ -287,49 +360,61 @@ pub fn rim_iterate(
         .min_cap
         .map(|c| if opts.cap_correction { c - 0.0001 } else { c });
 
-    // Convergence tracking
-    let pct_still = 1.0 - opts.convergence_threshold;
-    let mut diff_error = f64::INFINITY;
+    // Convergence tracking.
+    //
+    // Convergence is measured on MARGIN MISFIT — how far the achieved margins
+    // are from the targets — not on how far weights moved between iterations.
+    // Weight movement is only a proxy, and summing it over rows makes the
+    // tolerance scale with n, so the same threshold is far looser on a 200-row
+    // subgroup than on a 1M-row file. Margin misfit is what the caller actually
+    // asked for and is scale-invariant. R survey's calibrate and ipfn both do
+    // this; weightipy (which this engine originally followed) does not.
+    let mut prev_misfit = f64::INFINITY;
+    let mut stall_rounds = 0_u32;
     let mut converged = false;
+    let mut stalled = false;
     let mut iteration = 0;
-
-    // Pre-allocate old_weights buffer (reused each iteration — no allocation in loop)
-    let mut old_weights = vec![0.0_f64; n];
 
     for iter in 1..=opts.max_iterations {
         iteration = iter;
 
-        // Save current weights (memcpy, no allocation)
-        old_weights.copy_from_slice(&weights);
-
-        // Rake on each variable
+        // Rake each variable, tracking the largest correction any of them needed.
+        let mut misfit = 0.0_f64;
         for (col, props) in &normalized {
-            rake_on_variable(&mut weights, &index_caches[col], props, n_f64);
+            misfit = misfit.max(rake_on_variable(
+                &mut weights,
+                &index_caches[col],
+                props,
+                n_f64,
+            ));
         }
 
         // Apply caps
         apply_caps(&mut weights, effective_min_cap, effective_max_cap);
 
-        // Convergence metric: sum of absolute differences
-        let new_diff_error: f64 = weights
-            .iter()
-            .zip(old_weights.iter())
-            .map(|(w, o)| (w - o).abs())
-            .sum();
-
-        // Converged if error below threshold
-        if new_diff_error < opts.convergence_threshold {
+        // Converged when no variable needed a correction beyond the threshold,
+        // i.e. every margin was already satisfied on entry to this sweep.
+        if misfit < opts.convergence_threshold {
             converged = true;
             break;
         }
 
-        // Converged if weights have stabilized (progress stalled)
-        if iter > 1 && new_diff_error >= pct_still * diff_error {
-            converged = true;
-            break;
+        // Stall guard, deliberately decoupled from the threshold: it answers
+        // "are we still making progress?", a different question from "are the
+        // margins met?". Under contradictory targets the misfit plateaus above
+        // the threshold forever; bail out rather than burn max_iterations, but
+        // report it as a failure, never as convergence.
+        if misfit >= prev_misfit * (1.0 - STALL_TOLERANCE) {
+            stall_rounds += 1;
+            if stall_rounds >= STALL_ROUNDS {
+                stalled = true;
+                break;
+            }
+        } else {
+            stall_rounds = 0;
         }
 
-        diff_error = new_diff_error;
+        prev_misfit = misfit;
     }
 
     // Replace zeros with 1.0 and compute min/max in a single pass
@@ -348,11 +433,14 @@ pub fn rim_iterate(
     }
 
     let efficiency = calculate_efficiency(&weights);
+    let max_target_gap = measure_target_gap(&weights, &index_caches, &normalized, n_f64);
 
     Ok(RakeResult {
         weights,
         iterations: iteration,
         converged,
+        stalled,
+        max_target_gap,
         efficiency,
         weight_min,
         weight_max,
