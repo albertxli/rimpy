@@ -373,6 +373,33 @@ Notes:
   reproducible and under the sheet author's control.
 - Ragged targets are fine: a variable defined for one split only (a
   country-specific income band, say) is raked for that split alone.
+- **A whole code frame can be pasted in as-is.** Code frames carry every
+  category, including ones nobody fell into. A `0` target on a category with no
+  rows in the data is dropped with a warning rather than raised, so those rows
+  need not be stripped first. A *non-zero* target on an absent category still
+  raises — that one is a real mismatch.
+- If a `split_var` column is present and holds more than one distinct value, a
+  warning is raised: targets are keyed by `split_value` alone, so split values
+  shared across two different split variables would collide.
+
+#### What raises
+
+The loader is strict about the things a spreadsheet gets wrong quietly:
+
+| Problem | Result |
+|---------|--------|
+| A required column missing | `KeyError` naming it and listing the columns found |
+| The same `(split_value, target_var, target_value)` twice | `ValueError` naming the group and code |
+| A blank in `split_value`, `target_var` or `target_value` | `ValueError` with the column and row count |
+| Two different `target_pct` values in one `combine` group | `ValueError` showing both |
+| A `combine` group with no `target_pct` at all | `ValueError` |
+| `target_pct` not numeric (`"49%"`, thousands separators) | `ValueError` |
+| An unsupported file extension | `ValueError` listing the supported ones |
+| An `.xlsx` source with no Excel engine installed | `ImportError` pointing at `rimpy[excel]` |
+
+Fully blank rows are dropped silently — trailing empty rows are routine in
+spreadsheets. Targets that sum to neither 100 nor 1 warn rather than raise, and
+`validate=False` silences that check.
 
 ## Convergence
 
